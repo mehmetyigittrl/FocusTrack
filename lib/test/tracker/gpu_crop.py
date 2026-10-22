@@ -9,6 +9,10 @@ from lib.utils.tir_stack import stack_pair_gpu  # noqa: F401  re-export (see tir
 # NOTE: grid_sample bilinear differs from the CPU path's cv2.resize by sub-pixel
 # interpolation details (sampling-center convention, border blending with zeros
 # instead of crop-then-resize); acceptable for tracking.
+# Parity with the CPU path (lib.train.data.processing_utils.sample_target) includes
+# its drop-last-row/column quirk at the frame edges: x2_pad = max(x2 - W + 1, 0)
+# (and the y counterpart) discards the last real frame column/row whenever the crop
+# reaches past it, so the crop then sees an effectively (W-1)/(H-1)-sized frame.
 
 
 def gpu_sample_target(frame, target_bb, search_area_factor, output_sz, min_crop_size, mean, std):
@@ -38,10 +42,16 @@ def gpu_sample_target(frame, target_bb, search_area_factor, output_sz, min_crop_
     x1 = round(x + 0.5 * w - crop_sz * 0.5)
     y1 = round(y + 0.5 * h - crop_sz * 0.5)
 
+    # effective frame size: when the crop reaches past the right/bottom edge the CPU
+    # path's x2_pad/y2_pad (+1) drops the last real column/row, so the sampling grid
+    # must treat the frame as one pixel smaller there (interior geometry is unchanged)
+    W_eff = W - 1 if x1 + crop_sz >= W else W
+    H_eff = H - 1 if y1 + crop_sz >= H else H
+
     # affine theta mapping output normalized coords to frame normalized coords:
     # output pixel j samples frame coordinate x1 + (j + 0.5) * crop_sz / output_sz - 0.5
-    theta = frame.new_tensor([[crop_sz / W, 0.0, (2.0 * x1 + crop_sz) / W - 1.0],
-                              [0.0, crop_sz / H, (2.0 * y1 + crop_sz) / H - 1.0]]).unsqueeze(0)
+    theta = frame.new_tensor([[crop_sz / W_eff, 0.0, (2.0 * x1 + crop_sz) / W_eff - 1.0],
+                              [0.0, crop_sz / H_eff, (2.0 * y1 + crop_sz) / H_eff - 1.0]]).unsqueeze(0)
     grid = F.affine_grid(theta, (1, C, output_sz, output_sz), align_corners=False)
     img = F.grid_sample(frame.unsqueeze(0), grid, mode='bilinear', padding_mode='zeros', align_corners=False)
 

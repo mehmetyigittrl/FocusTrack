@@ -5,6 +5,9 @@ import numpy as np
 from lib.utils.box_ops import box_cxcywh_to_xyxy, box_xywh_to_xyxy, box_xyxy_to_xywh
 from lib.utils.tir_stack import stack_pair
 
+# (dataset name, seq id) keys already warned for failed TIR prev-frame fetches: one warning per sequence
+_tir_prev_warned = set()
+
 
 def no_processing(data):
     return data
@@ -25,7 +28,7 @@ class TrackingSampler(torch.utils.data.Dataset):
     def __init__(self, datasets, p_datasets, samples_per_epoch, max_gap,
                  num_search_frames, num_template_frames=1, processing=no_processing, 
                  frame_sample_mode='causal',
-                 train_cls=False, pos_prob=0.5, tir_delta=None, seed: int=0):
+                 train_cls=False, pos_prob=0.5, tir_delta=None, tir_delta_template=None, seed: int=0):
         """
         args:
             datasets - List of datasets to be used for training
@@ -37,8 +40,10 @@ class TrackingSampler(torch.utils.data.Dataset):
             processing - An instance of Processing class which performs the necessary processing of the data.
             frame_sample_mode - Either 'causal' or 'interval'. If 'causal', then the test frames are sampled in a causally,
                                 otherwise randomly within the interval.
-            tir_delta - If set, each template/search image is replaced by the 3-channel temporal stack
+            tir_delta - If set, each search image is replaced by the 3-channel temporal stack
                         [I_t, I_prev, |I_t - I_prev|] with I_prev taken tir_delta frames earlier. None = off.
+            tir_delta_template - Frame gap used when stacking template images; None leaves template frames
+                        unstacked even when tir_delta is set (DATA.TIR_STACK.TEMPLATE_STACK).
         """
         self.datasets = datasets
         self.train_cls = train_cls  # whether we are training classification
@@ -59,6 +64,7 @@ class TrackingSampler(torch.utils.data.Dataset):
         self.processing = processing
         self.frame_sample_mode = frame_sample_mode
         self.tir_delta = tir_delta    # frame gap for temporal 3-channel stacking, None = off
+        self.tir_delta_template = tir_delta_template    # template stacking gap; None = keep templates unstacked
         
         # 引入随机种子
         self._EXT_SEED_STEP = 30011  # better to be a prime number
@@ -151,7 +157,8 @@ class TrackingSampler(torch.utils.data.Dataset):
                     search_frames, search_anno, meta_obj_test = dataset.get_frames(seq_id[1], search_frame_ids, seq_info_dict[1])
                     if self.tir_delta is not None:
                         template_frames = self._stack_tir_pairs(dataset, seq_id[0], seq_info_dict[0],
-                                                                template_frame_ids, template_frames)
+                                                                template_frame_ids, template_frames,
+                                                                is_template=True)
                         search_frames = self._stack_tir_pairs(dataset, seq_id[1], seq_info_dict[1],
                                                               search_frame_ids, search_frames)
                     
@@ -246,7 +253,8 @@ class TrackingSampler(torch.utils.data.Dataset):
 
                     if self.tir_delta is not None:
                         template_frames = self._stack_tir_pairs(dataset, seq_id, seq_info_dict,
-                                                                template_frame_ids, template_frames)
+                                                                template_frame_ids, template_frames,
+                                                                is_template=True)
                         search_frames = self._stack_tir_pairs(dataset, seq_id, seq_info_dict,
                                                               search_frame_ids, search_frames)
 
@@ -278,14 +286,23 @@ class TrackingSampler(torch.utils.data.Dataset):
             
         return data
 
-    def _stack_tir_pairs(self, dataset, seq_id, seq_info_dict, frame_ids, frames):
+    def _stack_tir_pairs(self, dataset, seq_id, seq_info_dict, frame_ids, frames, is_template=False):
         # replace each frame with the uint8 stack [I_t, I_prev, |I_t - I_prev|]; prev = cur if fetching it fails
+        if is_template and self.tir_delta_template is None:
+            return frames    # DATA.TIR_STACK.TEMPLATE_STACK off: train templates unstacked
+        delta = self.tir_delta_template if is_template else self.tir_delta
         stacked = []
         for f_id, img in zip(frame_ids, frames):
             try:
-                prev_img = dataset.get_frames(seq_id, [max(0, f_id - self.tir_delta)], seq_info_dict)[0][0]
-            except:
-                prev_img = img
+                prev_img = dataset.get_frames(seq_id, [max(0, f_id - delta)], seq_info_dict)[0][0]
+            except Exception:
+                prev_img = img    # fallback prev=cur -> zero diff channel
+                warn_key = (dataset.get_name(), seq_id)
+                if warn_key not in _tir_prev_warned:    # one warning per sequence, not per frame
+                    _tir_prev_warned.add(warn_key)
+                    print('Warning: TIR prev-frame fetch failed for {} seq {} (first failing frame {}); '
+                          'falling back to prev=cur (zero diff channel)'.format(
+                              dataset.get_name(), seq_id, f_id))
             stacked.append(stack_pair(img, prev_img))
         return stacked
 

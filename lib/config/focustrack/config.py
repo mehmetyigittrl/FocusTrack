@@ -174,6 +174,7 @@ cfg.TEST.ENLARGE_STEP = 1.0
 cfg.TEST.T_LOGITS = 0.8
 cfg.TEST.T_SCORE = 0.5
 cfg.TEST.GPU_CROP = False    # crop search/template regions on GPU
+cfg.TEST.FP16 = False    # half-precision inference; required to hit the >143 FPS spec on RTX 5060-class GPUs
 cfg.TEST.T_CLS_PROB = 0.8    # sigmoid presence-prob threshold for SRA escalation
 cfg.TEST.DYNAMIC_TEMPLATE = False    # update the template online during tracking
 cfg.TEST.TEMPLATE_UPDATE_SCORE = 0.70

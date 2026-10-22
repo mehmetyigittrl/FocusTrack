@@ -91,9 +91,10 @@ def generalized_box_iou(boxes1, boxes2):
 
 def _buffer_boxes(boxes, buffer_ratio=0.2, min_buffer=0.015):
     # symmetric expansion around the center, preserves x2 >= x1
+    # total growth per axis = max(dim * buffer_ratio, min_buffer), split evenly on both sides
     x1, y1, x2, y2 = boxes.unbind(-1)
-    pad_w = torch.maximum((x2 - x1) * buffer_ratio, torch.full_like(x1, min_buffer))
-    pad_h = torch.maximum((y2 - y1) * buffer_ratio, torch.full_like(y1, min_buffer))
+    pad_w = torch.maximum((x2 - x1) * buffer_ratio, torch.full_like(x1, min_buffer)) / 2.0
+    pad_h = torch.maximum((y2 - y1) * buffer_ratio, torch.full_like(y1, min_buffer)) / 2.0
     return torch.stack([x1 - pad_w, y1 - pad_h, x2 + pad_w, y2 + pad_h], dim=-1)
 
 

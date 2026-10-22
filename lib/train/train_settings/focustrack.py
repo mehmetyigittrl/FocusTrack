@@ -108,6 +108,7 @@ def build_dataloaders(cfg, settings):
     train_cls = getattr(cfg.TRAIN, "TRAIN_CLS", False)
     print("sampler_mode", sampler_mode)
     tir_delta = cfg.DATA.TIR_STACK.DELTA if cfg.DATA.TIR_STACK.USE else None
+    tir_delta_template = tir_delta if cfg.DATA.TIR_STACK.TEMPLATE_STACK else None
     dataset_train = sampler.TrackingSampler(datasets=names2datasets(cfg.DATA.TRAIN.DATASETS_NAME, settings, opencv_loader),
                                             p_datasets=cfg.DATA.TRAIN.DATASETS_RATIO,
                                             samples_per_epoch=cfg.DATA.TRAIN.SAMPLE_PER_EPOCH,
@@ -116,6 +117,7 @@ def build_dataloaders(cfg, settings):
                                             frame_sample_mode=sampler_mode, train_cls=train_cls, 
                                             pos_prob=pos_prob,
                                             tir_delta=tir_delta,
+                                            tir_delta_template=tir_delta_template,
                                             seed=settings.local_rank)
 
     train_sampler = DistributedSampler(dataset_train) if settings.local_rank != -1 else None
@@ -131,6 +133,7 @@ def build_dataloaders(cfg, settings):
                                           max_gap=cfg.DATA.MAX_SAMPLE_INTERVAL, num_search_frames=settings.num_search,
                                           num_template_frames=settings.num_template, processing=data_processing_val,
                                           frame_sample_mode=sampler_mode, train_cls=train_cls , tir_delta=tir_delta,
+                                          tir_delta_template=tir_delta_template,
                                           seed=settings.local_rank)
     val_sampler = DistributedSampler(dataset_val) if settings.local_rank != -1 else None
     loader_val = LTRLoader('val', dataset_val, training=False, batch_size=cfg.TRAIN.BATCH_SIZE,

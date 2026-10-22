@@ -33,6 +33,10 @@ class FocusTrack(BaseTracker):
         self.cfg = params.cfg
         self.network = network.cuda()
         self.network.eval()
+        # half-precision inference (TEST.FP16): cast weights once; inputs are cast per forward
+        self.fp16 = getattr(self.cfg.TEST, 'FP16', False)
+        if self.fp16:
+            self.network.half()
         self.preprocessor = Preprocessor(self.cfg.DATA.MEAN, self.cfg.DATA.STD)
         self.state = None
         self.feat_sz = self.cfg.TEST.SEARCH.SIZE // self.cfg.MODEL.BACKBONE.STRIDE
@@ -89,6 +93,8 @@ class FocusTrack(BaseTracker):
         self.std = self.cfg.DATA.STD
         self.tir_hist_gpu = deque(maxlen=max(1, self.tir_delta))
         self.tir_hist_np = deque(maxlen=max(1, self.tir_delta))
+        assert not (self.use_tir_stack and self.use_grid), \
+            "TIR temporal stacking is not supported in grid mode (TEST.SEARCH.GRID.USE_GRID); disable one"
 
     def initialize(self, image, info: dict):
         # forward the template once
@@ -178,7 +184,8 @@ class FocusTrack(BaseTracker):
                                                                     min_crop_size=self._esc_min_crop())  # (x1, y1, w, h)
             x_dict = self.preprocessor.process(x_patch_arr, x_amask_arr)   # 经过reshape的search
         else:
-            x_patch_arr, x_amask_arr, resize_factor = sample_target(image, self.state, self.search_factor)  # (x1, y1, w, h)
+            x_patch_arr, x_amask_arr, resize_factor = sample_target(image, self.state, self.search_factor,
+                                                                    min_crop_size=self._esc_min_crop())  # (x1, y1, w, h)
             
             img_shape_ori = x_patch_arr.shape
             img_metas = [
@@ -202,7 +209,18 @@ class FocusTrack(BaseTracker):
             self.tir_hist_np.append(image)
 
         with torch.no_grad():
-            out_dict = self.network.forward(template=self.z_dict1.tensors, search=x_dict.tensors, training=False)
+            template_tensors = self.z_dict1.tensors.half() if self.fp16 else self.z_dict1.tensors
+            search_tensors = x_dict.tensors.half() if self.fp16 else x_dict.tensors
+            out_dict = self.network.forward(template=template_tensors, search=search_tensors, training=False)
+            if self.fp16:
+                # keep downstream box/score math and numpy/cv2 conversions in fp32
+                out_dict['score_map'] = out_dict['score_map'].float()
+                out_dict['size_map'] = out_dict['size_map'].float()
+                out_dict['offset_map'] = out_dict['offset_map'].float()
+                if 'logits' in out_dict:
+                    out_dict['logits'] = out_dict['logits'].float()
+                if out_dict.get('full_mask') is not None:
+                    out_dict['full_mask'] = out_dict['full_mask'].float()
         
         # add hann windows
         pred_score_map = out_dict['score_map']
@@ -336,7 +354,7 @@ class FocusTrack(BaseTracker):
                         self.step = False 
                         break
                 
-                if 'full_mask' in out_dict:
+                if out_dict.get('full_mask') is not None:
                     search_size = self.cfg.DATA.SEARCH.SIZE * self.cfg.DATA.SEARCH.SIZE
                     search_mask = out_dict['full_mask'][:,-search_size: ]
                     if search_mask.dim() == 2:
@@ -357,7 +375,8 @@ class FocusTrack(BaseTracker):
                     self.visdom.register(torch.from_numpy(overlay).permute(2, 0, 1), 'image', 1, 'full_mask')
                     
                     
-                    self.visdom.register(out_dict['feat_mask'].view(self.feat_sz, self.feat_sz), 'heatmap', 1, 'feat_mask')
+                    if 'feat_mask' in out_dict:
+                        self.visdom.register(out_dict['feat_mask'].view(self.feat_sz, self.feat_sz), 'heatmap', 1, 'feat_mask')
         
 
         if self.save_all_boxes:

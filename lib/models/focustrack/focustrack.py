@@ -31,7 +31,7 @@ class FocusTrack(nn.Module):
         self.num_token_z = self.backbone.pos_embed_z.shape[1]
         self.num_token_x = self.backbone.pos_embed_x.shape[1]
         self.nun_clstoken = 1 if self.backbone.add_cls_token else 0
-        self.decoder = decoder if decoder is not nn.Identity() else None
+        self.decoder = None if isinstance(decoder, nn.Identity) else decoder
         self.box_head = box_head
         if use_cls_head :
             self.cls_head = cls_head
@@ -53,7 +53,7 @@ class FocusTrack(nn.Module):
             feat_last = x[-1]
         
         # decoder
-        if 'intermediate_outputs' in aux_dict and type(self.decoder) != nn.Identity:
+        if 'intermediate_outputs' in aux_dict and self.decoder is not None:
             intermediate_outputs = aux_dict['intermediate_outputs']
             masks_x, pred_masks_full = self.decoder(intermediate_outputs, 
                                                         self.num_token_decoder,)

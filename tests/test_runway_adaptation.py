@@ -113,7 +113,7 @@ def test_03_get_jittered_box():
             scale_jitter_factor={"template": 0.3, "search": 0.0},
             mode="pair",
             settings=None,
-            min_crop_size=64.0,
+            min_crop_size={"template": 32.0, "search": 64.0},  # dict form, as production passes it
         )
 
     for cls in (STARKProcessing, QpProcessing):
@@ -158,6 +158,72 @@ def test_03_get_jittered_box():
             assert torch.allclose(adapted, legacy, atol=1e-6), (adapted, legacy)
 
 
+# ---------------------------------------------------------------- case 3b
+def test_03b_processing_call():
+    import numpy as np
+    import torch
+
+    import lib.train.data.transforms as tfm
+    from lib.train.data.processing import QpProcessing, STARKProcessing
+    from lib.train.data.processing_utils import transform_image_to_crop
+    from lib.utils import TensorDict
+
+    def make(cls):
+        # QpProcessing additionally needs use_grid; STARKProcessing forwards kwargs
+        # to BaseProcessing, so only pass it where it is accepted
+        extra = {} if cls is STARKProcessing else {"use_grid": {"template": False, "search": False}}
+        return cls(
+            search_area_factor={"template": 2.0, "search": 6.0},
+            output_sz={"template": 128, "search": 256},
+            center_jitter_factor={"template": 3.0, "search": 4.5},
+            scale_jitter_factor={"template": 0.3, "search": 0.0},
+            mode="pair",
+            transform=tfm.Transform(tfm.ToTensor()),  # val-style: no random roll
+            joint_transform=None,
+            settings=None,
+            min_crop_size={"template": 32.0, "search": 64.0},
+            **extra,
+        )
+
+    img = np.zeros((1080, 1920, 3), dtype=np.uint8)
+    img[500:560, 900:980] = 180  # background texture inside every crop
+    anno = torch.tensor([950.0, 520.0, 3.0, 5.0])  # 3x5 px target, center (951.5, 522.5)
+
+    for cls in (STARKProcessing, QpProcessing):
+        proc = make(cls)
+        data = TensorDict({
+            "template_images": [img],
+            "search_images": [img],
+            "template_anno": [anno.clone()],
+            "search_anno": [anno.clone()],
+            # masks must be real tensors (datasets always supply them); None breaks
+            # the per-sample split in the transform
+            "template_masks": [torch.zeros(1080, 1920)],
+            "search_masks": [torch.zeros(1080, 1920)],
+        })
+        # _get_jittered_box draws from the global torch RNG, so a fixed seed makes
+        # __call__ deterministic and lets the expected anno be replayed below
+        seed = 1234
+        torch.manual_seed(seed)
+        out = proc(data)
+        assert bool(out["valid"]) is True
+        assert tuple(out["search_images"].shape) == (3, 256, 256)
+        assert tuple(out["template_images"].shape) == (3, 128, 128)
+        assert out["search_att"].dtype == torch.bool
+
+        # replay the same RNG stream: __call__ jitters 'template' before 'search'
+        torch.manual_seed(seed)
+        proc._get_jittered_box(anno, "template")
+        jb = proc._get_jittered_box(anno, "search")
+        # search scale_jitter is 0.0 -> size unchanged -> crop clamped to 64 px, rf = 4
+        expected = transform_image_to_crop(
+            anno, jb, 256.0 / 64.0, torch.tensor([256.0, 256.0]), normalize=True)
+        assert torch.allclose(out["search_anno"], expected, atol=1e-4), (out["search_anno"], expected)
+        # the 3x5 px target maps through the 64 -> 256 clamp to ~12x20 px in the tensor
+        assert abs(expected[2].item() - 12.0 / 256.0) < 1e-4, expected
+        assert abs(expected[3].item() - 20.0 / 256.0) < 1e-4, expected
+
+
 # ---------------------------------------------------------------- case 4
 def test_04_buffered_giou():
     import torch
@@ -183,7 +249,7 @@ def test_04_buffered_giou():
     buf_giou, _ = generalized_buffered_box_iou(a, b)
     std_drop = 1.0 - std_giou.item()
     buf_drop = 1.0 - buf_giou.item()
-    assert buf_drop < 0.5 * std_drop, (buf_drop, std_drop)
+    assert buf_drop < 0.6 * std_drop, (buf_drop, std_drop)
 
     # invariants: x2 >= x1 kept, centers preserved, pads respect ratio/min
     buf = _buffer_boxes(a, 0.2, 0.015)
@@ -191,12 +257,20 @@ def test_04_buffered_giou():
     c_orig = (a[:, :2] + a[:, 2:]) / 2.0
     c_buf = (buf[:, :2] + buf[:, 2:]) / 2.0
     assert torch.allclose(c_orig, c_buf, atol=1e-7)
+    # total growth per axis = max(dim * buffer_ratio, min_buffer), split evenly on both sides
+    grow_w = (buf[0, 2] - buf[0, 0]).item() - (a[0, 2] - a[0, 0]).item()
+    grow_h = (buf[0, 3] - buf[0, 1]).item() - (a[0, 3] - a[0, 1]).item()
+    assert abs(grow_w - 0.015) < 1e-6 and abs(grow_h - 0.015) < 1e-6  # min_buffer dominates tiny boxes (f32 tol)
     pad_w = a[0, 0].item() - buf[0, 0].item()
     pad_h = a[0, 1].item() - buf[0, 1].item()
-    assert abs(pad_w - 0.015) < 1e-6 and abs(pad_h - 0.015) < 1e-6  # min_buffer dominates tiny boxes (f32 tol)
+    assert abs(pad_w - 0.015 / 2.0) < 1e-6 and abs(pad_h - 0.015 / 2.0) < 1e-6  # half of the growth per side
     big = torch.tensor([[0.1, 0.1, 0.5, 0.5]])
     buf_big = _buffer_boxes(big, 0.2, 0.015)
-    assert abs((buf_big[0, 2] - buf_big[0, 0]).item() - 0.4 * (1.0 + 2 * 0.2)) < 1e-6  # ratio dominates big boxes (f32 tol)
+    assert abs((buf_big[0, 2] - buf_big[0, 0]).item() - 0.4 * (1.0 + 0.2)) < 1e-6  # large box: +20% width total (f32 tol)
+    tiny = torch.tensor([[0.1, 0.1, 0.1 + 0.078, 0.1 + 0.078]])
+    buf_tiny = _buffer_boxes(tiny, 0.2, 0.015)
+    grow_tiny = (buf_tiny[0, 2] - buf_tiny[0, 0]).item() - 0.078
+    assert abs(grow_tiny - max(0.078 * 0.2, 0.015)) < 1e-6  # ratio branch: 0.0156 total, not 2x0.0156 (f32 tol)
     # also non-degenerate self-consistency: buffered iou == plain iou for a big box vs itself
     g_self, _ = generalized_buffered_box_iou(big, big)
     assert abs(g_self.item() - 1.0) < 1e-6
@@ -262,7 +336,8 @@ def test_06_model_build_forward():
 
     from lib.models.focustrack.focustrack import build_focustrack
 
-    assert torch.cuda.is_available(), "CUDA required for this case"
+    if not torch.cuda.is_available():
+        return "skip"  # CUDA required for this case
     dev = "cuda"
 
     cfg = fresh_cfg("focustrack_ftir_stage2.yaml")  # stride 12 -> 21x21 map
@@ -311,15 +386,17 @@ def test_07_tir_stacking():
     s3 = stack_pair(a3, b)
     assert np.array_equal(s3[:, :, 0], a)  # 3-channel input uses channel 0
 
-    assert torch.cuda.is_available()
-    cur = torch.from_numpy(a.astype(np.float32))[None].cuda()   # (1,H,W)
-    prev = torch.from_numpy(b.astype(np.float32))[None].cuda()
-    g = stack_pair_gpu(cur, prev)
-    assert g.shape == (3, 64, 80) and g.is_cuda
-    ref = torch.from_numpy(s.astype(np.float32)).permute(2, 0, 1)  # stack_pair is HWC, stack_pair_gpu is CHW
-    assert torch.allclose(g.cpu(), ref, atol=1.5), "GPU/CPU stacking parity"
-    g0 = stack_pair_gpu(cur, cur)
-    assert g0[2].abs().max().item() == 0.0
+    if torch.cuda.is_available():
+        cur = torch.from_numpy(a.astype(np.float32))[None].cuda()   # (1,H,W)
+        prev = torch.from_numpy(b.astype(np.float32))[None].cuda()
+        g = stack_pair_gpu(cur, prev)
+        assert g.shape == (3, 64, 80) and g.is_cuda
+        ref = torch.from_numpy(s.astype(np.float32)).permute(2, 0, 1)  # stack_pair is HWC, stack_pair_gpu is CHW
+        assert torch.allclose(g.cpu(), ref, atol=1.5), "GPU/CPU stacking parity"
+        g0 = stack_pair_gpu(cur, cur)
+        assert g0[2].abs().max().item() == 0.0
+    else:
+        print("note: CUDA unavailable, GPU stacking sub-checks skipped")
 
     st = TIRFrameStacker(delta=1)
     first = st.stack(a)
@@ -338,7 +415,8 @@ def test_08_gpu_sample_target():
     from lib.test.tracker.gpu_crop import gpu_sample_target
     from lib.train.data.processing_utils import sample_target
 
-    assert torch.cuda.is_available()
+    if not torch.cuda.is_available():
+        return "skip"  # gpu_sample_target requires CUDA
     torch.manual_seed(0)
     frame = torch.rand(3, 1080, 1920, device="cuda") * 255.0
     mean = [0.485, 0.456, 0.406]
@@ -359,6 +437,47 @@ def test_08_gpu_sample_target():
     assert abs(float(rf) - float(rf_cpu)) < 1e-9  # CPU/GPU resize_factor agreement
     assert att_cpu.dtype == np.bool_ and att_cpu.shape == (256, 256)
     assert not att_cpu.any()
+
+
+# ---------------------------------------------------------------- case 8b
+def test_08b_border_parity():
+    import numpy as np
+    import torch
+
+    from lib.test.tracker.gpu_crop import gpu_sample_target
+    from lib.train.data.processing_utils import sample_target
+
+    if not torch.cuda.is_available():
+        return "skip"  # gpu_sample_target requires CUDA
+    # 1920x1080 frame, bright markers at the very corner:
+    #   (1079, 1919) - last real row/col, dropped by the CPU edge quirk (x2_pad/y2_pad)
+    #   (1078, 1918) - last row/col the CPU crop actually keeps
+    im = np.zeros((1080, 1920, 3), dtype=np.uint8)
+    im[1079, 1919] = 255
+    im[1078, 1918] = 200
+    # center (1880, 1040), crop_sz = ceil(sqrt(64*64)*4) = 256 = output_sz -> 1:1
+    # crop -> x1 = 1752, x2 = 2008 >= W and y1 = 912, y2 = 1168 >= H: both edges crossed
+    bb = [1848.0, 1008.0, 64.0, 64.0]
+
+    crop, rf_cpu, att_cpu = sample_target(im, bb, 4.0, output_sz=256, min_crop_size=64.0)
+    frame = torch.from_numpy(im.transpose(2, 0, 1)).float().cuda()
+    img, rf_gpu, att_gpu = gpu_sample_target(frame, bb, 4.0, 256, 64.0,
+                                             [0.0, 0.0, 0.0], [1.0, 1.0, 1.0])
+    assert abs(rf_cpu - 1.0) < 1e-9 and abs(float(rf_gpu) - 1.0) < 1e-9
+
+    # (a) brightest output pixel must land on the same row/col on both paths; a path
+    # that keeps the dropped last row/col would see the 255 marker at (167, 167)
+    cpu_pos = np.unravel_index(int(crop.astype(np.float32).sum(axis=2).argmax()), crop.shape[:2])
+    flat = int(img[0].sum(dim=0).argmax())
+    gpu_pos = (flat // 256, flat % 256)
+    assert cpu_pos == gpu_pos == (166, 166), (cpu_pos, gpu_pos)
+    assert crop[166, 166, 0] == 200 and crop[167, 167, 0] == 0  # CPU drops (1079, 1919)
+
+    # (b) invalid-mask pixel counts match exactly (True = sourced from outside)
+    att_gpu_np = att_gpu.cpu().numpy()
+    assert att_cpu.dtype == np.bool_ and att_gpu_np.dtype == np.bool_
+    assert int(att_cpu.sum()) == int(att_gpu_np.sum()) > 0  # 256^2 - 167^2 = 37647
+    assert np.array_equal(att_cpu, att_gpu_np)
 
 
 # ---------------------------------------------------------------- case 9
@@ -494,11 +613,13 @@ CASES = [
     ("01_config_update", test_01_config_update),
     ("02_sample_target_clamp", test_02_sample_target_clamp),
     ("03_get_jittered_box", test_03_get_jittered_box),
+    ("03b_processing_call", test_03b_processing_call),
     ("04_buffered_giou", test_04_buffered_giou),
     ("05_patch_embed_overlapping", test_05_patch_embed_overlapping),
     ("06_model_build_forward", test_06_model_build_forward),
     ("07_tir_stacking", test_07_tir_stacking),
     ("08_gpu_sample_target", test_08_gpu_sample_target),
+    ("08b_border_parity", test_08b_border_parity),
     ("09_import_surface", test_09_import_surface),
     ("10_actor_buffered_loss_stub", test_10_actor_buffered_loss_stub),
     ("11_full_ckpt_stride_transition", test_11_full_ckpt_stride_transition),
@@ -507,10 +628,15 @@ CASES = [
 
 def main():
     failures = []
+    skipped = []
     for name, fn in CASES:
         try:
-            fn()
-            print(f"PASS {name}", flush=True)
+            res = fn()
+            if res == "skip":
+                print(f"SKIP {name}", flush=True)
+                skipped.append(name)
+            else:
+                print(f"PASS {name}", flush=True)
         except Exception:
             print(f"FAIL {name}", flush=True)
             traceback.print_exc()
@@ -519,6 +645,9 @@ def main():
     if failures:
         print(f"SUMMARY: {len(failures)} FAILED: {failures}", flush=True)
         return 1
+    if skipped:
+        print(f"SUMMARY: {len(CASES) - len(skipped)} CASES PASS, {len(skipped)} SKIPPED: {skipped}", flush=True)
+        return 0
     print("SUMMARY: ALL {} CASES PASS".format(len(CASES)), flush=True)
     return 0
 
