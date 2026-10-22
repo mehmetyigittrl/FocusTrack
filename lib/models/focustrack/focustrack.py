@@ -230,7 +230,7 @@ def build_focustrack(cfg, settings=None, training=True):
                     'FULL_CKPT not found; tried {!r} and {!r}. The trainer saves '
                     'FocusTrack_ep<NNNN>.pth.tar checkpoints (note the .tar suffix).'.format(
                         full_ckpt, full_ckpt + '.tar'))
-        checkpoint = torch.load(full_ckpt, map_location="cpu")
+        checkpoint = torch.load(full_ckpt, map_location="cpu", weights_only=False)
         ckpt_net = _adapt_full_ckpt(model, checkpoint["net"])
         missing_keys, unexpected_keys = model.load_state_dict(ckpt_net, strict=False)
         print('Load full checkpoint from: ' + full_ckpt)

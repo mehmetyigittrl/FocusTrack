@@ -64,9 +64,9 @@ class TrackingSampler(torch.utils.data.Dataset):
         self._EXT_SEED_STEP = 30011  # better to be a prime number
         self._SEED_STEP = 10007  # better to be a prime number
         self._SEED_DIVIDER = 1000003  # better to be a prime number
-        self.ext_seed = seed
-        
-        self.rng = np.random.RandomState(seed)   # seed是传入的
+        self.ext_seed = seed if seed is not None and seed >= 0 else 0  # local_rank is -1 outside DDP
+
+        self.rng = np.random.RandomState(self.ext_seed)   # seed是传入的
         self.positive_pair_ratio = pos_prob
         self.negative_pair_ratio = 1.0-pos_prob
         
