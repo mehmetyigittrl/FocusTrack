@@ -161,6 +161,11 @@ class VisionTransformer(BaseBackbone):
         x = self.patch_embed(x)
         z = self.patch_embed(z)
 
+        assert x.shape[1] == self.pos_embed_x.shape[1], \
+            'search token count {} does not match pos_embed_x count {}'.format(x.shape[1], self.pos_embed_x.shape[1])
+        assert z.shape[1] == self.pos_embed_z.shape[1], \
+            'template token count {} does not match pos_embed_z count {}'.format(z.shape[1], self.pos_embed_z.shape[1])
+
         if self.add_cls_token:
             cls_tokens = self.cls_token.expand(B, -1, -1)
             cls_tokens = cls_tokens + self.cls_pos_embed
@@ -375,7 +380,7 @@ def _load_weights(model: VisionTransformer, checkpoint_path: str, prefix: str = 
         block.norm2.bias.copy_(_n2p(w[f'{block_prefix}LayerNorm_2/bias']))
 
 
-def resize_pos_embed(posemb, posemb_new, num_tokens=1, gs_new=()):
+def resize_pos_embed(posemb, posemb_new, num_tokens=1, gs_new=(), mode='bilinear'):
     # Rescale the grid of position embeddings when loading from state_dict. Adapted from
     # https://github.com/google-research/vision_transformer/blob/00883dd691c63a6830751563748663526e811cee/vit_jax/checkpoint.py#L224
     print('Resized position embedding: %s to %s', posemb.shape, posemb_new.shape)
@@ -391,7 +396,7 @@ def resize_pos_embed(posemb, posemb_new, num_tokens=1, gs_new=()):
     assert len(gs_new) >= 2
     print('Position embedding grid-size from %s to %s', [gs_old, gs_old], gs_new)
     posemb_grid = posemb_grid.reshape(1, gs_old, gs_old, -1).permute(0, 3, 1, 2)
-    posemb_grid = F.interpolate(posemb_grid, size=gs_new, mode='bilinear')
+    posemb_grid = F.interpolate(posemb_grid, size=gs_new, mode=mode)
     posemb_grid = posemb_grid.permute(0, 2, 3, 1).reshape(1, gs_new[0] * gs_new[1], -1)
     posemb = torch.cat([posemb_tok, posemb_grid], dim=1)
     return posemb
@@ -411,7 +416,8 @@ def checkpoint_filter_fn(state_dict, model):
         elif k == 'pos_embed' and v.shape != model.pos_embed.shape:
             # To resize pos embedding when using model at different size from pretrained weights
             v = resize_pos_embed(
-                v, model.pos_embed, getattr(model, 'num_tokens', 1), model.patch_embed.grid_size)
+                v, model.pos_embed, getattr(model, 'num_tokens', 1), model.patch_embed.grid_size,
+                mode='bicubic')
         out_dict[k] = v
     return out_dict
 
@@ -427,7 +433,8 @@ def _create_vision_transformer(variant, pretrained=False, default_cfg=None, **kw
             model.load_pretrained(pretrained, prefix='')
         else:
             checkpoint = torch.load(pretrained, map_location="cpu")
-            missing_keys, unexpected_keys = model.load_state_dict(checkpoint["model"], strict=False)
+            checkpoint = checkpoint_filter_fn(checkpoint, model)
+            missing_keys, unexpected_keys = model.load_state_dict(checkpoint, strict=False)
             print('Load pretrained model from: ' + pretrained)
             print("missing keys:", missing_keys)
             print("unexpected keys:", unexpected_keys)

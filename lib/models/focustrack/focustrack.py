@@ -110,22 +110,86 @@ class FocusTrack(nn.Module):
             raise NotImplementedError
 
 
+def _split_grid_tokens(num_tokens):
+    """Split a flattened token count into (leading non-grid tokens, square grid edge)."""
+    grid = int(math.sqrt(num_tokens))
+    return num_tokens - grid * grid, grid
+
+
+def _resize_grid_pos_embed(embed, target_shape):
+    """Bicubically resample a flattened square-grid position embedding to target_shape.
+
+    Covers the token-grid tensors that change when MODEL.BACKBONE.STRIDE changes
+    (e.g. FTIR stage1 STRIDE 16 -> stage2 STRIDE 12): the (1, N, C) backbone pos
+    embeds and the (P + N, C) cls-head attention-pool embedding, whose P leading
+    non-grid tokens are passed through unchanged. Returns None when the shapes do
+    not fit either layout, so the caller can drop the key instead.
+    """
+    if embed.dim() not in (2, 3) or len(target_shape) != embed.dim() \
+            or embed.shape[-1] != target_shape[-1]:
+        return None
+    if embed.dim() == 3 and embed.shape[0] != target_shape[0]:
+        return None  # batch axis of the (1, N, C) pos embeds must match
+    prefix_old, grid_old = _split_grid_tokens(embed.shape[-2])
+    prefix_new, grid_new = _split_grid_tokens(target_shape[-2])
+    if grid_old < 1 or grid_new < 1 or prefix_old != prefix_new or prefix_old > 1:
+        return None
+    tokens = embed.reshape(1, -1, embed.shape[-1])  # (1, P + g*g, C)
+    grid = tokens[:, prefix_old:].reshape(1, grid_old, grid_old, -1).permute(0, 3, 1, 2)
+    grid = nn.functional.interpolate(grid, size=(grid_new, grid_new), mode='bicubic',
+                                     align_corners=False)
+    grid = grid.flatten(2).permute(0, 2, 1)  # (1, g'*g', C)
+    return torch.cat([tokens[:, :prefix_old], grid], dim=1).reshape(target_shape)
+
+
+def _adapt_full_ckpt(model, state_dict):
+    """Adapt a full checkpoint saved under a different token grid.
+
+    load_state_dict(strict=False) still raises on size mismatches, so when e.g. a
+    STRIDE-16 stage1 checkpoint initializes a STRIDE-12 stage2 model, resample the
+    grid position embeddings bicubically (as finetune_track does for pos_embed)
+    and drop any other shape-mismatched keys with a warning so they keep their
+    fresh initialization.
+    """
+    model_state = model.state_dict()
+    adapted = {}
+    for key, value in state_dict.items():
+        if key not in model_state or value.shape == model_state[key].shape:
+            adapted[key] = value
+            continue
+        resized = _resize_grid_pos_embed(value, model_state[key].shape)
+        if resized is not None:
+            print('Resized checkpoint {} {} -> {} for the new token grid'.format(
+                key, tuple(value.shape), tuple(model_state[key].shape)))
+            adapted[key] = resized
+        else:
+            print('WARNING: checkpoint key {} has shape {} but the model wants {}; '
+                  'keeping the fresh initialization'.format(
+                      key, tuple(value.shape), tuple(model_state[key].shape)))
+    return adapted
+
+
 def build_focustrack(cfg, settings=None, training=True):
     
     current_dir = os.path.dirname(os.path.abspath(__file__))  # This is your Project Root
     pretrained_path = os.path.join(current_dir, '../../../pretrained_models')
-    if cfg.MODEL.PRETRAIN_FILE and ('FocusTrack' not in cfg.MODEL.PRETRAIN_FILE) and training:
+    full_ckpt = getattr(cfg.TRAIN, 'FULL_CKPT', '')
+    if full_ckpt and training:
+        # full-ckpt init supersedes the DropMAE backbone pretrained join below
+        pretrained = ''
+    elif cfg.MODEL.PRETRAIN_FILE and ('FocusTrack' not in cfg.MODEL.PRETRAIN_FILE) and training:
         pretrained = os.path.join(pretrained_path, cfg.MODEL.PRETRAIN_FILE)
     else:
         pretrained = ''
 
     if cfg.MODEL.BACKBONE.TYPE == 'vit_base_patch16_224':
-        backbone = vit_base_patch16_224(pretrained, 
+        backbone = vit_base_patch16_224(pretrained,
                                         drop_path_rate=cfg.TRAIN.DROP_PATH_RATE,
                                         add_cls_token=cfg.MODEL.BACKBONE.ADD_CLS_TOKEN,
                                         use_cls_token=cfg.MODEL.HEAD.CLS_HEAD.USE_CLS_TOKEN,
                                         num_classes=cfg.MODEL.HEAD.CLS_HEAD.NUM_CLASSES,
-                                        out_indices=cfg.MODEL.BACKBONE.OUT_INDICES,)
+                                        out_indices=cfg.MODEL.BACKBONE.OUT_INDICES,
+                                        in_chans=cfg.MODEL.BACKBONE.IN_CHANS,)
         hidden_dim = backbone.embed_dim
         patch_start_index = 1
         backbone.finetune_track(cfg=cfg, patch_start_index=patch_start_index)
@@ -155,7 +219,24 @@ def build_focustrack(cfg, settings=None, training=True):
         use_cls_head=cfg.MODEL.HEAD.CLS_HEAD.USE_CLS_TOKEN,
     )
 
-    if 'FocusTrack' in cfg.MODEL.PRETRAIN_FILE and cfg.TRAIN.TRAIN_SECOND_STAGE and training:
+    if full_ckpt and training:
+        # full-ckpt init: path is relative to the repo root (training cwd)
+        # tolerate a '.pth' path: the trainer saves 'FocusTrack_ep{:04d}.pth.tar'
+        if not os.path.exists(full_ckpt):
+            if os.path.exists(full_ckpt + '.tar'):
+                full_ckpt = full_ckpt + '.tar'
+            else:
+                raise FileNotFoundError(
+                    'FULL_CKPT not found; tried {!r} and {!r}. The trainer saves '
+                    'FocusTrack_ep<NNNN>.pth.tar checkpoints (note the .tar suffix).'.format(
+                        full_ckpt, full_ckpt + '.tar'))
+        checkpoint = torch.load(full_ckpt, map_location="cpu")
+        ckpt_net = _adapt_full_ckpt(model, checkpoint["net"])
+        missing_keys, unexpected_keys = model.load_state_dict(ckpt_net, strict=False)
+        print('Load full checkpoint from: ' + full_ckpt)
+        print("missing keys:", missing_keys)
+        print("unexpected keys:", unexpected_keys)
+    elif 'FocusTrack' in cfg.MODEL.PRETRAIN_FILE and cfg.TRAIN.TRAIN_SECOND_STAGE and training:
         if settings is None:
             raise ValueError('settings is None')
         script_name = settings.script_name

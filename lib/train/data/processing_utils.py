@@ -9,7 +9,7 @@ Replace cv.BORDER_REPLICATE with cv.BORDER_CONSTANT
 Add a variable called att_mask for computing attention and positional encoding later'''
 from lib.utils.box_ops import box_xywh_to_xyxy
 
-def sample_target(im, target_bb, search_area_factor, output_sz=None, mask=None):
+def sample_target(im, target_bb, search_area_factor, output_sz=None, mask=None, min_crop_size=None):
     """ Extracts a square crop centered at target_bb box, of area search_area_factor^2 times target_bb area
 
     args:
@@ -17,6 +17,7 @@ def sample_target(im, target_bb, search_area_factor, output_sz=None, mask=None):
         target_bb - target box [x, y, w, h]
         search_area_factor - Ratio of crop size to target size
         output_sz - (float) Size to which the extracted crop is resized (always square). If None, no resizing is done.
+        min_crop_size - (float) Minimum crop size in pixels. If None, no lower bound is enforced.
 
     returns:
         cv image - extracted crop
@@ -28,6 +29,8 @@ def sample_target(im, target_bb, search_area_factor, output_sz=None, mask=None):
         x, y, w, h = target_bb
     # Crop image
     crop_sz = math.ceil(math.sqrt(w * h) * search_area_factor)
+    if min_crop_size is not None:
+        crop_sz = int(max(min_crop_size, crop_sz))
 
     if crop_sz < 1:
         raise Exception('Too small bounding box.')
@@ -104,7 +107,7 @@ def transform_image_to_crop(box_in: torch.Tensor, box_extract: torch.Tensor, res
         return box_out
 
 
-def jittered_center_crop(frames, box_extract, box_gt, search_area_factor, output_sz, masks=None):
+def jittered_center_crop(frames, box_extract, box_gt, search_area_factor, output_sz, masks=None, min_crop_size=None):
     """ For each frame in frames, extracts a square crop centered at box_extract, of area search_area_factor^2
     times box_extract area. The extracted crops are then resized to output_sz. Further, the co-ordinates of the box
     box_gt are transformed to the image crop co-ordinates
@@ -123,12 +126,12 @@ def jittered_center_crop(frames, box_extract, box_gt, search_area_factor, output
         """
 
     if masks is None:
-        crops_resize_factors = [sample_target(f, a, search_area_factor, output_sz)
+        crops_resize_factors = [sample_target(f, a, search_area_factor, output_sz, min_crop_size=min_crop_size)
                                 for f, a in zip(frames, box_extract)]
         frames_crop, resize_factors, att_mask = zip(*crops_resize_factors)
         masks_crop = None
     else:
-        crops_resize_factors = [sample_target(f, a, search_area_factor, output_sz, m)
+        crops_resize_factors = [sample_target(f, a, search_area_factor, output_sz, m, min_crop_size=min_crop_size)
                                 for f, a, m in zip(frames, box_extract, masks)]
         frames_crop, resize_factors, att_mask, masks_crop = zip(*crops_resize_factors)
     # frames_crop: tuple of ndarray (128,128,3), att_mask: tuple of ndarray (128,128)
@@ -141,7 +144,7 @@ def jittered_center_crop(frames, box_extract, box_gt, search_area_factor, output
 
     return frames_crop, box_crop, att_mask, masks_crop
 
-def jittered_center_crop_noResize(frames, box_extract, box_gt, search_area_factor, output_sz=None, masks=None):
+def jittered_center_crop_noResize(frames, box_extract, box_gt, search_area_factor, output_sz=None, masks=None, min_crop_size=None):
     """ For each frame in frames, extracts a square crop centered at box_extract, of area search_area_factor^2
     times box_extract area. The extracted crops are then resized to output_sz. Further, the co-ordinates of the box
     box_gt are transformed to the image crop co-ordinates
@@ -160,12 +163,12 @@ def jittered_center_crop_noResize(frames, box_extract, box_gt, search_area_facto
         """
     num_frames = len(frames)
     if masks is None:
-        crops_resize_factors = [sample_target(f, a, search_area_factor, output_sz)
+        crops_resize_factors = [sample_target(f, a, search_area_factor, output_sz, min_crop_size=min_crop_size)
                                 for f, a in zip(frames, box_extract)]
         frames_crop, resize_factors, att_mask = zip(*crops_resize_factors)
         masks_crop = None
     else:
-        crops_resize_factors = [sample_target(f, a, search_area_factor, output_sz, m)
+        crops_resize_factors = [sample_target(f, a, search_area_factor, output_sz, m, min_crop_size=min_crop_size)
                                 for f, a, m in zip(frames, box_extract, masks)]
         frames_crop, resize_factors, att_mask, masks_crop = zip(*crops_resize_factors)
     # frames_crop: tuple of ndarray (128,128,3), att_mask: tuple of ndarray (128,128)

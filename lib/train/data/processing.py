@@ -47,7 +47,7 @@ class STARKProcessing(BaseProcessing):
     """
 
     def __init__(self, search_area_factor, output_sz, center_jitter_factor, scale_jitter_factor,
-                 mode='pair', settings=None, *args, **kwargs):
+                 mode='pair', settings=None, min_crop_size=None, *args, **kwargs):
         """
         args:
             search_area_factor - The size of the search region  relative to the target size.
@@ -66,6 +66,7 @@ class STARKProcessing(BaseProcessing):
         self.scale_jitter_factor = scale_jitter_factor
         self.mode = mode
         self.settings = settings
+        self.min_crop_size = min_crop_size
 
     def _get_jittered_box(self, box, mode):
         """ Jitter the input box
@@ -78,7 +79,15 @@ class STARKProcessing(BaseProcessing):
         """
 
         jittered_size = box[2:4] * torch.exp(torch.randn(2) * self.scale_jitter_factor[mode])
-        max_offset = (jittered_size.prod().sqrt() * torch.tensor(self.center_jitter_factor[mode]).float())
+        scale_s = jittered_size.prod().sqrt()
+        if mode == 'search':
+            # Scale-adaptive center jitter: floor prevents under-jittering tiny targets,
+            # reduced factor keeps large flare-phase targets from being pushed out of the crop
+            effective_scale = torch.clamp(scale_s, min=10.0)
+            dyn_jitter = 1.8 if scale_s > 100.0 else 2.5
+            max_offset = effective_scale * dyn_jitter
+        else:
+            max_offset = scale_s * torch.tensor(self.center_jitter_factor[mode]).float()
         jittered_center = box[0:2] + 0.5 * box[2:4] + max_offset * (torch.rand(2) - 0.5)
 
         return torch.cat((jittered_center - 0.5 * jittered_size, jittered_size), dim=0)
@@ -116,9 +125,11 @@ class STARKProcessing(BaseProcessing):
                 return data
 
             # Crop image region centered at jittered_anno box and get the attention mask
+            min_crop_size = self.min_crop_size.get(s) if self.min_crop_size is not None else None
             crops, boxes, att_mask, mask_crops = prutils.jittered_center_crop(data[s + '_images'], jittered_anno,
                                                                               data[s + '_anno'], self.search_area_factor[s],
-                                                                              self.output_sz[s], masks=data[s + '_masks'])
+                                                                              self.output_sz[s], masks=data[s + '_masks'],
+                                                                              min_crop_size=min_crop_size)
             # Apply transforms
             data[s + '_images'], data[s + '_anno'], data[s + '_att'], data[s + '_masks'] = self.transform[s](
                 image=crops, bbox=boxes, att=att_mask, mask=mask_crops, joint=False)
@@ -157,8 +168,8 @@ class STARKProcessing(BaseProcessing):
 
 class QpProcessing(BaseProcessing):
     def __init__(self, search_area_factor, output_sz, center_jitter_factor, scale_jitter_factor,
-                 mode='pair', settings=None, jitter_anno_prob=0, grid_generator=None, 
-                 gt_gauss_generator=False, use_grid=None, *args, **kwargs):
+                 mode='pair', settings=None, jitter_anno_prob=0, grid_generator=None,
+                 gt_gauss_generator=False, use_grid=None, min_crop_size=None, *args, **kwargs):
         """
         args:
             search_area_factor - The size of the search region  relative to the target size.
@@ -177,6 +188,7 @@ class QpProcessing(BaseProcessing):
         self.scale_jitter_factor = scale_jitter_factor
         self.mode = mode
         self.settings = settings
+        self.min_crop_size = min_crop_size
 
         self.jitter_anno_prob = jitter_anno_prob
         self.grid_generator = grid_generator
@@ -195,7 +207,15 @@ class QpProcessing(BaseProcessing):
         """
 
         jittered_size = box[2:4] * torch.exp(torch.randn(2) * self.scale_jitter_factor[mode])
-        max_offset = (jittered_size.prod().sqrt() * torch.tensor(self.center_jitter_factor[mode]).float())
+        scale_s = jittered_size.prod().sqrt()
+        if mode == 'search':
+            # Scale-adaptive center jitter: floor prevents under-jittering tiny targets,
+            # reduced factor keeps large flare-phase targets from being pushed out of the crop
+            effective_scale = torch.clamp(scale_s, min=10.0)
+            dyn_jitter = 1.8 if scale_s > 100.0 else 2.5
+            max_offset = effective_scale * dyn_jitter
+        else:
+            max_offset = scale_s * torch.tensor(self.center_jitter_factor[mode]).float()
         jittered_center = box[0:2] + 0.5 * box[2:4] + max_offset * (torch.rand(2) - 0.5)
 
         return torch.cat((jittered_center - 0.5 * jittered_size, jittered_size), dim=0)
@@ -236,16 +256,19 @@ class QpProcessing(BaseProcessing):
                 data['valid'] = False
                 # print("Too small box is found. Replace it with new data.")
                 return data
+            min_crop_size = self.min_crop_size.get(s) if self.min_crop_size is not None else None
             if self.use_grid[s]:
                 # Crop image region centered at jittered_anno box and get the attention mask
                 crops, boxes, att_mask, mask_crops = prutils.jittered_center_crop_noResize(data[s + '_images'], jittered_anno,
                                                                                 data[s + '_anno'], self.search_area_factor[s],
-                                                                                masks=data[s + '_masks'])
+                                                                                masks=data[s + '_masks'],
+                                                                                min_crop_size=min_crop_size)
             else:
                 # Crop image region centered at jittered_anno box and get the attention mask
                 crops, boxes, att_mask, mask_crops = prutils.jittered_center_crop(data[s + '_images'], jittered_anno,
                                                                                 data[s + '_anno'], self.search_area_factor[s],
-                                                                                self.output_sz[s], masks=data[s + '_masks'])
+                                                                                self.output_sz[s], masks=data[s + '_masks'],
+                                                                                min_crop_size=min_crop_size)
             # Apply transforms
             data[s + '_images'], data[s + '_anno'], data[s + '_att'], data[s + '_masks'] = self.transform[s](
                 image=crops, bbox=boxes, att=att_mask, mask=mask_crops, joint=False)

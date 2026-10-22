@@ -12,7 +12,12 @@ from typing import Optional
 import math
 from functools import partial
 import matplotlib.pyplot as plt
-from mmseg.models.decode_heads.decode_head import BaseDecodeHead
+# mmseg is optional: only required when MODEL.DECODER.ADD_DECODER is True (ATM head).
+# Guard the import so SRA-only configs (ADD_DECODER False) import/build without mmseg.
+try:
+    from mmseg.models.decode_heads.decode_head import BaseDecodeHead
+except ImportError:
+    BaseDecodeHead = None
 from timm.models.layers import trunc_normal_
 import matplotlib.pyplot as plt
 
@@ -132,7 +137,7 @@ class MLP(nn.Module):
         return x
 
 
-class ATMHead(BaseDecodeHead):
+class ATMHead(nn.Module if BaseDecodeHead is None else BaseDecodeHead):
     def __init__(
             self,
             img_size_x,
@@ -264,6 +269,11 @@ class ATMHead(BaseDecodeHead):
 
 def build_decoder(cfg, hidden_dim=768, pretrained=False):
     if cfg.MODEL.DECODER.ADD_DECODER:
+        if BaseDecodeHead is None:
+            raise RuntimeError(
+                'MODEL.DECODER.ADD_DECODER is True but the ATM decode head requires mmseg '
+                '(mmsegmentation), which is not installed. Install mmsegmentation/mmcv or '
+                'disable the decoder (MODEL.DECODER.ADD_DECODER: False) for SRA-only configs.')
         decoder = ATMHead(
                     img_size_x=cfg.DATA.SEARCH.SIZE,
                     img_size_z=cfg.DATA.TEMPLATE.SIZE,

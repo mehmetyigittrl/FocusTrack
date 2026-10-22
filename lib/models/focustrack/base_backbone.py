@@ -1,3 +1,4 @@
+import math
 from functools import partial
 
 import torch
@@ -38,7 +39,8 @@ class BaseBackbone(nn.Module):
 
         search_size = to_2tuple(cfg.DATA.SEARCH.SIZE)
         template_size = to_2tuple(cfg.DATA.TEMPLATE.SIZE)
-        new_patch_size = cfg.MODEL.BACKBONE.STRIDE
+        patch_size = getattr(cfg.MODEL.BACKBONE, "PATCH_SIZE", 16)
+        stride = cfg.MODEL.BACKBONE.STRIDE
 
         self.cat_mode = cfg.MODEL.BACKBONE.CAT_MODE
         self.return_inter = cfg.MODEL.RETURN_INTER
@@ -46,16 +48,26 @@ class BaseBackbone(nn.Module):
         self.add_sep_seg = cfg.MODEL.BACKBONE.SEP_SEG
 
         # resize patch embedding
-        if new_patch_size != self.patch_size:
+        if stride != patch_size:
+            # overlapping patches: keep the pretrained kernel as-is, change stride only
+            print('Overlapping Patch Embedding: Kernel {}, Stride {}'.format(patch_size, stride))
+            old_proj_weight = self.patch_embed.proj.weight
+            old_proj_bias = self.patch_embed.proj.bias
+            self.patch_embed = PatchEmbed(img_size=self.img_size, patch_size=patch_size, stride=stride,
+                                          padding=(patch_size - stride) // 2,
+                                          in_chans=old_proj_weight.shape[1], embed_dim=self.embed_dim)
+            self.patch_embed.proj.weight = old_proj_weight
+            self.patch_embed.proj.bias = old_proj_bias
+        elif stride != self.patch_size:
             print('Inconsistent Patch Size With The Pretrained Weights, Interpolate The Weight!')
             old_patch_embed = {}
             for name, param in self.patch_embed.named_parameters():
                 if 'weight' in name:
-                    param = nn.functional.interpolate(param, size=(new_patch_size, new_patch_size),
+                    param = nn.functional.interpolate(param, size=(stride, stride),
                                                       mode='bicubic', align_corners=False)
                     param = nn.Parameter(param)
                 old_patch_embed[name] = param
-            self.patch_embed = PatchEmbed(img_size=self.img_size, patch_size=new_patch_size, in_chans=3,
+            self.patch_embed = PatchEmbed(img_size=self.img_size, patch_size=stride, in_chans=3,
                                           embed_dim=self.embed_dim)
             self.patch_embed.proj.bias = old_patch_embed['proj.bias']
             self.patch_embed.proj.weight = old_patch_embed['proj.weight']
@@ -64,25 +76,36 @@ class BaseBackbone(nn.Module):
         patch_pos_embed = self.pos_embed[:, patch_start_index:, :]
         patch_pos_embed = patch_pos_embed.transpose(1, 2)
         B, E, Q = patch_pos_embed.shape
-        P_H, P_W = self.img_size[0] // self.patch_size, self.img_size[1] // self.patch_size
+        P_H = P_W = int(math.sqrt(Q))
         patch_pos_embed = patch_pos_embed.view(B, E, P_H, P_W)
 
         # for search region
         H, W = search_size
-        new_P_H, new_P_W = H // new_patch_size, W // new_patch_size
+        new_P_H, new_P_W = H // stride, W // stride
         search_patch_pos_embed = nn.functional.interpolate(patch_pos_embed, size=(new_P_H, new_P_W), mode='bicubic',
                                                            align_corners=False)
         search_patch_pos_embed = search_patch_pos_embed.flatten(2).transpose(1, 2)
 
         # for template region
         H, W = template_size
-        new_P_H, new_P_W = H // new_patch_size, W // new_patch_size
+        new_P_H, new_P_W = H // stride, W // stride
         template_patch_pos_embed = nn.functional.interpolate(patch_pos_embed, size=(new_P_H, new_P_W), mode='bicubic',
                                                              align_corners=False)
         template_patch_pos_embed = template_patch_pos_embed.flatten(2).transpose(1, 2)
 
         self.pos_embed_z = nn.Parameter(template_patch_pos_embed)
         self.pos_embed_x = nn.Parameter(search_patch_pos_embed)
+
+        # check the patch conv output grid matches the pos-embed grids
+        conv = self.patch_embed.proj
+        for name, size, pos_embed in (('search', search_size, self.pos_embed_x),
+                                      ('template', template_size, self.pos_embed_z)):
+            conv_hw = [(s + 2 * p - k) // st + 1 for s, p, k, st in
+                       zip(size, conv.padding, conv.kernel_size, conv.stride)]
+            assert conv_hw[0] * conv_hw[1] == pos_embed.shape[1], \
+                '{} PatchEmbed conv output grid {} gives {} tokens, but its pos-embed has {} tokens; ' \
+                'check MODEL.BACKBONE.PATCH_SIZE / STRIDE against DATA.{}.SIZE'.format(
+                    name, conv_hw, conv_hw[0] * conv_hw[1], pos_embed.shape[1], name.upper())
         # 根据 finturn track中的 num_tokens 调整
         if self.add_cls_token:
             self.num_tokens_all = [1, self.pos_embed_z.shape[1], self.pos_embed_x.shape[1]]

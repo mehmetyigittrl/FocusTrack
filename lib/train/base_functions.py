@@ -1,7 +1,7 @@
 import torch
 from torch.utils.data.distributed import DistributedSampler
 # datasets related
-from lib.train.dataset import Lasot, Got10k, MSCOCOSeq, ImagenetVID, TrackingNet, AntiUAV410
+from lib.train.dataset import Lasot, Got10k, MSCOCOSeq, ImagenetVID, TrackingNet, AntiUAV410, LSOTB_TIR, RunwayTIR
 from lib.train.dataset import Lasot_lmdb, Got10k_lmdb, MSCOCOSeq_lmdb, ImagenetVID_lmdb, TrackingNet_lmdb
 from lib.train.data import sampler, opencv_loader, processing, LTRLoader
 import lib.train.data.transforms as tfm
@@ -29,7 +29,7 @@ def names2datasets(name_list: list, settings, image_loader):
     datasets = []
     for name in name_list:
         assert name in ["LASOT", "GOT10K_vottrain", "GOT10K_votval", "GOT10K_train_full", "GOT10K_official_val",
-                        "COCO17", "VID", "TRACKINGNET","AntiUAV410", "IRSTD1k", "IRSTD"]
+                        "COCO17", "VID", "TRACKINGNET","AntiUAV410", "LSOTB_TIR", "RunwayTIR", "IRSTD1k", "IRSTD"]
         if name == "LASOT":
             if settings.use_lmdb:
                 print("Building lasot dataset from lmdb")
@@ -85,6 +85,10 @@ def names2datasets(name_list: list, settings, image_loader):
             else:
                 # raise ValueError("NOW WE CAN ONLY USE TRACKINGNET FROM LMDB")
                 datasets.append(AntiUAV410(settings.env.antiuav410_dir, image_loader=image_loader))
+        if name == "LSOTB_TIR":
+            datasets.append(LSOTB_TIR(settings.env.lsotb_tir_dir, split='train', image_loader=image_loader))
+        if name == "RunwayTIR":
+            datasets.append(RunwayTIR(settings.env.runway_tir_dir, split='train', image_loader=image_loader))
         
         
     return datasets

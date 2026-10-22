@@ -72,6 +72,7 @@ def build_dataloaders(cfg, settings):
     settings.center_jitter_factor['correct'] = cfg.DATA.SEARCH.RANDOM_CENTER_JITTER
     settings.scale_jitter_factor['correct'] = cfg.DATA.SEARCH.RANDOM_SCALE_JITTER
     use_grid = {'search':cfg.DATA.SEARCH.GRID.USE_GRID, 'template':cfg.DATA.TEMPLATE.USE_GRID}
+    min_crop_size = {'template': cfg.DATA.TEMPLATE.MIN_CROP_SIZE, 'search': cfg.DATA.SEARCH.MIN_CROP_SIZE}
     pos_prob = getattr(cfg.DATA.TRAIN, "POS_PROB", 1.0)
     print("pos_prob", pos_prob)
     
@@ -85,7 +86,8 @@ def build_dataloaders(cfg, settings):
                                                     settings=settings,
                                                     grid_generator=grid_generator,
                                                     jitter_anno_prob=cfg.DATA.SEARCH.RANDOM_JITTER_RATIO,
-                                                    use_grid=use_grid)
+                                                    use_grid=use_grid,
+                                                    min_crop_size=min_crop_size)
     
     data_processing_val = processing.QpProcessing(search_area_factor=search_area_factor,
                                                     output_sz=output_sz,
@@ -97,13 +99,15 @@ def build_dataloaders(cfg, settings):
                                                     settings=settings,
                                                     grid_generator=grid_generator,
                                                     jitter_anno_prob=cfg.DATA.SEARCH.RANDOM_JITTER_RATIO,
-                                                    use_grid=use_grid)  
+                                                    use_grid=use_grid,
+                                                    min_crop_size=min_crop_size)  
     # Train sampler and loader
     settings.num_template = getattr(cfg.DATA.TEMPLATE, "NUMBER", 1)
     settings.num_search = getattr(cfg.DATA.SEARCH, "NUMBER", 1)
     sampler_mode = getattr(cfg.DATA, "SAMPLER_MODE", "causal")
     train_cls = getattr(cfg.TRAIN, "TRAIN_CLS", False)
     print("sampler_mode", sampler_mode)
+    tir_delta = cfg.DATA.TIR_STACK.DELTA if cfg.DATA.TIR_STACK.USE else None
     dataset_train = sampler.TrackingSampler(datasets=names2datasets(cfg.DATA.TRAIN.DATASETS_NAME, settings, opencv_loader),
                                             p_datasets=cfg.DATA.TRAIN.DATASETS_RATIO,
                                             samples_per_epoch=cfg.DATA.TRAIN.SAMPLE_PER_EPOCH,
@@ -111,6 +115,7 @@ def build_dataloaders(cfg, settings):
                                             num_template_frames=settings.num_template, processing=data_processing_train,
                                             frame_sample_mode=sampler_mode, train_cls=train_cls, 
                                             pos_prob=pos_prob,
+                                            tir_delta=tir_delta,
                                             seed=settings.local_rank)
 
     train_sampler = DistributedSampler(dataset_train) if settings.local_rank != -1 else None
@@ -125,7 +130,8 @@ def build_dataloaders(cfg, settings):
                                           samples_per_epoch=cfg.DATA.VAL.SAMPLE_PER_EPOCH,
                                           max_gap=cfg.DATA.MAX_SAMPLE_INTERVAL, num_search_frames=settings.num_search,
                                           num_template_frames=settings.num_template, processing=data_processing_val,
-                                          frame_sample_mode=sampler_mode, train_cls=train_cls , seed=settings.local_rank)
+                                          frame_sample_mode=sampler_mode, train_cls=train_cls , tir_delta=tir_delta,
+                                          seed=settings.local_rank)
     val_sampler = DistributedSampler(dataset_val) if settings.local_rank != -1 else None
     loader_val = LTRLoader('val', dataset_val, training=False, batch_size=cfg.TRAIN.BATCH_SIZE,
                            num_workers=cfg.TRAIN.NUM_WORKER, drop_last=True, stack_dim=1, sampler=val_sampler,

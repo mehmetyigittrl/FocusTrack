@@ -1,6 +1,6 @@
 from . import BaseActor
 from lib.utils.misc import NestedTensor
-from lib.utils.box_ops import box_cxcywh_to_xyxy, box_xywh_to_xyxy, box_xyxy_to_xywh
+from lib.utils.box_ops import box_cxcywh_to_xyxy, box_xywh_to_xyxy, box_xyxy_to_xywh, buffered_giou_loss
 import torch
 from lib.utils.merge import merge_template_search
 from ...utils.heapmap_utils import generate_heatmap_floor, generate_heatmap
@@ -92,7 +92,12 @@ class FocusTrackActor(BaseActor):
                                                                                                            max=1.0)  # (B,4) --> (B,1,4) --> (B,N,4)
         # compute giou and iou
         if self.loss_weight['giou'] > 0:
-            giou_loss, iou = self.objective['giou'](pred_boxes_vec, gt_boxes_vec)  # (BN,4) (BN,4)
+            if getattr(self.cfg.TRAIN, "BUFFERED_IOU", False):
+                giou_loss, iou = buffered_giou_loss(pred_boxes_vec, gt_boxes_vec,
+                                                    buffer_ratio=self.cfg.TRAIN.BUFFER_RATIO,
+                                                    min_buffer=self.cfg.TRAIN.MIN_BUFFER)  # (BN,4) (BN,4)
+            else:
+                giou_loss, iou = self.objective['giou'](pred_boxes_vec, gt_boxes_vec)  # (BN,4) (BN,4)
             giou_loss = (giou_loss * positive_mask).sum() / positive_mask.sum()
             mean_iou = (iou.detach() * positive_mask).sum() / positive_mask.sum()
             loss += giou_loss * self.loss_weight['giou'] 

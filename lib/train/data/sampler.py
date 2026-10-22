@@ -3,6 +3,7 @@ import torch.utils.data
 from lib.utils import TensorDict
 import numpy as np
 from lib.utils.box_ops import box_cxcywh_to_xyxy, box_xywh_to_xyxy, box_xyxy_to_xywh
+from lib.utils.tir_stack import stack_pair
 
 
 def no_processing(data):
@@ -24,7 +25,7 @@ class TrackingSampler(torch.utils.data.Dataset):
     def __init__(self, datasets, p_datasets, samples_per_epoch, max_gap,
                  num_search_frames, num_template_frames=1, processing=no_processing, 
                  frame_sample_mode='causal',
-                 train_cls=False, pos_prob=0.5, seed: int=0):
+                 train_cls=False, pos_prob=0.5, tir_delta=None, seed: int=0):
         """
         args:
             datasets - List of datasets to be used for training
@@ -36,6 +37,8 @@ class TrackingSampler(torch.utils.data.Dataset):
             processing - An instance of Processing class which performs the necessary processing of the data.
             frame_sample_mode - Either 'causal' or 'interval'. If 'causal', then the test frames are sampled in a causally,
                                 otherwise randomly within the interval.
+            tir_delta - If set, each template/search image is replaced by the 3-channel temporal stack
+                        [I_t, I_prev, |I_t - I_prev|] with I_prev taken tir_delta frames earlier. None = off.
         """
         self.datasets = datasets
         self.train_cls = train_cls  # whether we are training classification
@@ -55,6 +58,7 @@ class TrackingSampler(torch.utils.data.Dataset):
         self.num_template_frames = num_template_frames
         self.processing = processing
         self.frame_sample_mode = frame_sample_mode
+        self.tir_delta = tir_delta    # frame gap for temporal 3-channel stacking, None = off
         
         # 引入随机种子
         self._EXT_SEED_STEP = 30011  # better to be a prime number
@@ -145,6 +149,11 @@ class TrackingSampler(torch.utils.data.Dataset):
                     
                     template_frames, template_anno, meta_obj_train = dataset.get_frames(seq_id[0], template_frame_ids, seq_info_dict[0])
                     search_frames, search_anno, meta_obj_test = dataset.get_frames(seq_id[1], search_frame_ids, seq_info_dict[1])
+                    if self.tir_delta is not None:
+                        template_frames = self._stack_tir_pairs(dataset, seq_id[0], seq_info_dict[0],
+                                                                template_frame_ids, template_frames)
+                        search_frames = self._stack_tir_pairs(dataset, seq_id[1], seq_info_dict[1],
+                                                              search_frame_ids, search_frames)
                     
                     H_t, W_t, _ = template_frames[0].shape
                     # template_masks = template_anno['mask'] if 'mask' in template_anno else [torch.zeros((H_t, W_t))] * self.num_template_frames
@@ -235,6 +244,12 @@ class TrackingSampler(torch.utils.data.Dataset):
                     template_frames, template_anno, meta_obj_train = dataset.get_frames(seq_id, template_frame_ids, seq_info_dict)
                     search_frames, search_anno, meta_obj_test = dataset.get_frames(seq_id, search_frame_ids, seq_info_dict)
 
+                    if self.tir_delta is not None:
+                        template_frames = self._stack_tir_pairs(dataset, seq_id, seq_info_dict,
+                                                                template_frame_ids, template_frames)
+                        search_frames = self._stack_tir_pairs(dataset, seq_id, seq_info_dict,
+                                                              search_frame_ids, search_frames)
+
                     H, W, _ = template_frames[0].shape
                     # template_masks = template_anno['mask'] if 'mask' in template_anno else [torch.zeros((H, W))] * self.num_template_frames
                     # search_masks = search_anno['mask'] if 'mask' in search_anno else [torch.zeros((H, W))] * self.num_search_frames
@@ -262,6 +277,17 @@ class TrackingSampler(torch.utils.data.Dataset):
                     valid = False
             
         return data
+
+    def _stack_tir_pairs(self, dataset, seq_id, seq_info_dict, frame_ids, frames):
+        # replace each frame with the uint8 stack [I_t, I_prev, |I_t - I_prev|]; prev = cur if fetching it fails
+        stacked = []
+        for f_id, img in zip(frame_ids, frames):
+            try:
+                prev_img = dataset.get_frames(seq_id, [max(0, f_id - self.tir_delta)], seq_info_dict)[0][0]
+            except:
+                prev_img = img
+            stacked.append(stack_pair(img, prev_img))
+        return stacked
 
     def getitem_cls(self):
         # get data for classification

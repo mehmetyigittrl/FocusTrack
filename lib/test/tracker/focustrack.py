@@ -1,4 +1,5 @@
 import math
+from collections import deque
 
 from lib.models.focustrack import build_focustrack
 from lib.test.tracker.basetracker import BaseTracker
@@ -14,7 +15,10 @@ import os
 import numpy as np
 
 from lib.test.tracker.data_utils import Preprocessor
+from lib.test.tracker.gpu_crop import gpu_sample_target
 from lib.utils.box_ops import clip_box
+from lib.utils.misc import NestedTensor
+from lib.utils.tir_stack import stack_pair, stack_pair_gpu
 from lib.utils.ce_utils import generate_mask_cond
 from lib.train.data.grid_generator import unwarp_bboxes, unwarp_bboxes_batch, QPGrid
 from lib.utils.box_ops import box_cxcywh_to_xywh
@@ -29,7 +33,7 @@ class FocusTrack(BaseTracker):
         self.cfg = params.cfg
         self.network = network.cuda()
         self.network.eval()
-        self.preprocessor = Preprocessor()
+        self.preprocessor = Preprocessor(self.cfg.DATA.MEAN, self.cfg.DATA.STD)
         self.state = None
         self.feat_sz = self.cfg.TEST.SEARCH.SIZE // self.cfg.MODEL.BACKBONE.STRIDE
         self.output_window = hann2d(torch.tensor([self.feat_sz, self.feat_sz]).long(), 
@@ -70,14 +74,49 @@ class FocusTrack(BaseTracker):
         self.flag = 1
         self.use_hann=True
 
+        # gpu crop / tir stack / dynamic template gates
+        self.use_gpu_crop = self.cfg.TEST.GPU_CROP
+        self.search_min_crop_size = self.cfg.TEST.SEARCH.MIN_CROP_SIZE
+        self.template_min_crop_size = self.cfg.TEST.TEMPLATE.MIN_CROP_SIZE
+        self.use_tir_stack = self.cfg.DATA.TIR_STACK.USE
+        self.tir_delta = self.cfg.DATA.TIR_STACK.DELTA
+        self.tir_template_stack = self.cfg.DATA.TIR_STACK.TEMPLATE_STACK
+        self.use_dynamic_template = self.cfg.TEST.DYNAMIC_TEMPLATE
+        self.template_update_score = self.cfg.TEST.TEMPLATE_UPDATE_SCORE
+        self.template_update_prob = self.cfg.TEST.TEMPLATE_UPDATE_PROB
+        self.template_update_milestones = self.cfg.TEST.TEMPLATE_UPDATE_MILESTONES
+        self.mean = self.cfg.DATA.MEAN
+        self.std = self.cfg.DATA.STD
+        self.tir_hist_gpu = deque(maxlen=max(1, self.tir_delta))
+        self.tir_hist_np = deque(maxlen=max(1, self.tir_delta))
+
     def initialize(self, image, info: dict):
         # forward the template once
-        z_patch_arr, resize_factor, z_amask_arr = sample_target(image, info['init_bbox'], self.params.template_factor,
-                                                    output_sz=self.params.template_size)
+        z_img = image
+        if self.use_tir_stack and self.tir_template_stack:
+            z_img = stack_pair(image, image)  # no previous frame at init: diff channel is zero
+        z_patch_arr, resize_factor, z_amask_arr = sample_target(z_img, info['init_bbox'], self.params.template_factor,
+                                                    output_sz=self.params.template_size,
+                                                    min_crop_size=self.template_min_crop_size)
         self.z_patch_arr = z_patch_arr
         template = self.preprocessor.process(z_patch_arr, z_amask_arr)
         with torch.no_grad():
             self.z_dict1 = template
+
+        # dynamic template update state: scale ladder measured against the init box area
+        self.last_template_area = float(info['init_bbox'][2]) * float(info['init_bbox'][3])
+        self.template_milestone_idx = 0
+        # re-init support (e.g. video demo 'r' reset): restore the base search state,
+        # not whatever the escalation state machine left behind mid-video
+        self.search_factor = self.base_factor
+        self.use_hann = True
+        self.flag = 1
+        self.tir_hist_np = deque([image], maxlen=max(1, self.tir_delta))
+        if self.use_gpu_crop and not self.use_grid and not self.debug and self.use_tir_stack:
+            self.tir_hist_gpu = deque([torch.from_numpy(image).cuda().float().permute(2, 0, 1)],
+                                      maxlen=max(1, self.tir_delta))
+        else:
+            self.tir_hist_gpu = deque(maxlen=max(1, self.tir_delta))
 
         self.box_mask_z = None
 
@@ -98,17 +137,46 @@ class FocusTrack(BaseTracker):
         self.step = self.cfg.TEST.ENLARGE_STEP
         self.T_logits = self.cfg.TEST.T_LOGITS
         self.T_score = self.cfg.TEST.T_SCORE
-        
-        
+        self.T_cls_prob = self.cfg.TEST.T_CLS_PROB
+
+    def _esc_min_crop(self):
+        """ Factor-relative min crop floor: scale the tiny-target clamp with the search
+        factor so SRA escalation actually enlarges the search region. A fixed 64 px floor
+        is hit at both factor 6 and 8 for 3x5 px boxes, making escalation a no-op. """
+        return math.ceil(self.search_min_crop_size * self.search_factor / self.base_factor)
+
     def track(self, image, info: dict = None):
         H, W, _ = image.shape
         W_H = np.array([W, H])
         self.frame_id += 1
         self.former_box = self.state
+        # TIR prev frame read BEFORE the history append below, so the search stack and any
+        # dynamic template refresh both pair (I_t, I_{t-delta}) like the training sampler
+        prev_np = self.tir_hist_np[0] if self.use_tir_stack and self.tir_hist_np else image
         
-        if not self.use_grid:
-            x_patch_arr, resize_factor, x_amask_arr = sample_target(image, self.state, self.search_factor,
-                                                                    output_sz=self.params.search_size)  # (x1, y1, w, h)
+        if self.use_gpu_crop and not self.use_grid and not self.debug:
+            # fast path: upload once, crop + normalize on GPU (no CPU sample_target/preprocessor)
+            frame_cuda = torch.from_numpy(image).cuda().float().permute(2, 0, 1)  # (C,H,W) 0..255
+            if self.use_tir_stack:
+                prev_frame = self.tir_hist_gpu[0] if self.tir_hist_gpu else frame_cuda
+                search_frame = stack_pair_gpu(frame_cuda, prev_frame)
+                self.tir_hist_gpu.append(frame_cuda)
+            else:
+                search_frame = frame_cuda
+            x_tensor, resize_factor, x_amask = gpu_sample_target(search_frame, self.state, self.search_factor,
+                                                                 self.params.search_size,
+                                                                 self._esc_min_crop(), self.mean, self.std)
+            x_dict = NestedTensor(x_tensor, x_amask.unsqueeze(0))
+        elif not self.use_grid:
+            # CPU fallback: stack the TIR frame pair first so the search region has the same
+            # [I_t, I_prev, |diff|] semantics as the GPU fast path and the template branch.
+            search_img = image
+            if self.use_tir_stack:
+                search_img = stack_pair(image, prev_np)
+            x_patch_arr, resize_factor, x_amask_arr = sample_target(search_img, self.state, self.search_factor,
+                                                                    output_sz=self.params.search_size,
+                                                                    min_crop_size=self._esc_min_crop())  # (x1, y1, w, h)
+            x_dict = self.preprocessor.process(x_patch_arr, x_amask_arr)   # 经过reshape的search
         else:
             x_patch_arr, x_amask_arr, resize_factor = sample_target(image, self.state, self.search_factor)  # (x1, y1, w, h)
             
@@ -127,10 +195,13 @@ class FocusTrack(BaseTracker):
             x_patch_arr = x_patch_arr.cpu()[0].permute(1,2,0).numpy()    # (256, 256, 3)
         
         
-        search = self.preprocessor.process(x_patch_arr, x_amask_arr)   # 经过reshape的search
-    
+        if self.use_grid:
+            x_dict = self.preprocessor.process(x_patch_arr, x_amask_arr)   # 经过reshape的search
+
+        if self.use_tir_stack:
+            self.tir_hist_np.append(image)
+
         with torch.no_grad():
-            x_dict = search
             out_dict = self.network.forward(template=self.z_dict1.tensors, search=x_dict.tensors, training=False)
         
         # add hann windows
@@ -174,20 +245,44 @@ class FocusTrack(BaseTracker):
             self.state = clip_box(self.map_box_back_fullsize(unwraped_box[0].tolist(), x_patch_h), H, W, margin=10)
         
       
+        if self.cfg.TEST.USE_REGION_ADJUST or self.use_dynamic_template:
+            # presence prob: sigmoid over the 2-way cls logits (last class = target present);
+            # peak raw score (before hann); one stacked tensor -> a single host sync per frame
+            cls_prob = torch.sigmoid(out_dict['logits'])[0, -1]
+            max_score = out_dict['score_map'].max()
+            cls_prob, max_score = torch.stack([cls_prob, max_score]).cpu().tolist()
+
         if self.cfg.TEST.USE_REGION_ADJUST:
-            self.flag = F.softmax(out_dict['logits'].cpu(), dim=1)[0][-1].item()
-            if self.flag < self.T_logits:  
-                if pred_score_map.max()< self.T_score: 
-                    self.use_hann=False
-                    self.search_factor = self.search_factor + self.step
-                    if self.search_factor > self.max_search_area_factor:
-                        self.search_factor = self.max_search_area_factor
-                else:   
-                    self.search_factor = self.base_factor
-                    self.use_hann=True
-            else: 
-                self.search_factor = self.base_factor  
-                self.use_hann=True
+            # OR-gating: escalate on either weak presence or a flat score map, catching the
+            # single-signal failures the old AND-gated softmax logic missed
+            self.flag = cls_prob
+            if cls_prob < self.T_cls_prob or max_score < self.T_score:
+                self.search_factor = min(self.search_factor + self.step, self.max_search_area_factor)
+            else:
+                self.search_factor = self.base_factor
+            self.use_hann = self.search_factor <= self.base_factor
+
+        if self.use_dynamic_template and max_score > self.template_update_score \
+                and cls_prob > self.template_update_prob:
+            # safe scale-aware template refresh in place (single template z_dict1);
+            # never on low-confidence frames - that is the whole point
+            area = float(self.state[2]) * float(self.state[3])
+            milestones = self.template_update_milestones
+            milestone = milestones[min(self.template_milestone_idx, len(milestones) - 1)]
+            if area >= milestone * self.last_template_area:
+                # milestone ladder 2x/4x/8x/16x; the idx is capped at the last rung so
+                # growth beyond 16x keeps refreshing at every further 16x
+                z_img = image
+                if self.use_tir_stack and self.tir_template_stack:
+                    z_img = stack_pair(image, prev_np)
+                z_patch_arr, _, z_amask_arr = sample_target(z_img, self.state, self.params.template_factor,
+                                                            output_sz=self.params.template_size,
+                                                            min_crop_size=self.template_min_crop_size)
+                with torch.no_grad():
+                    self.z_dict1 = self.preprocessor.process(z_patch_arr, z_amask_arr)
+                self.z_patch_arr = z_patch_arr
+                self.last_template_area = area
+                self.template_milestone_idx = min(self.template_milestone_idx + 1, len(milestones) - 1)
                 
         
         if self.debug:

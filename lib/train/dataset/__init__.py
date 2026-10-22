@@ -10,3 +10,5 @@ from .imagenetvid_lmdb import ImagenetVID_lmdb
 from .coco_seq_lmdb import MSCOCOSeq_lmdb
 from .tracking_net_lmdb import TrackingNet_lmdb
 from .antiuav410 import AntiUAV410
+from .lsotb_tir import LSOTB_TIR
+from .runway_tir import RunwayTIR

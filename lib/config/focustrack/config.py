@@ -18,6 +18,9 @@ cfg.MODEL.RETURN_STAGES = []
 cfg.MODEL.BACKBONE = edict()
 cfg.MODEL.BACKBONE.TYPE = "vit_base_patch16_224"
 cfg.MODEL.BACKBONE.STRIDE = 16
+cfg.MODEL.BACKBONE.PATCH_SIZE = 16    # patch conv kernel; STRIDE may differ (overlapping patches)
+cfg.MODEL.BACKBONE.IN_CHANS = 3    # 3 channels: RGB or stacked TIR (cur, prev, diff)
+cfg.MODEL.BACKBONE.CE_LOC = []    # documentation only: FocusTrack has no Candidate Elimination
 cfg.MODEL.BACKBONE.MID_PE = False
 cfg.MODEL.BACKBONE.SEP_SEG = False
 cfg.MODEL.BACKBONE.CAT_MODE = 'direct'
@@ -69,6 +72,10 @@ cfg.TRAIN.AMP = False
 cfg.TRAIN.SAVE_INTERVAL = 40
 cfg.TRAIN.EXTRA_SAVE_EPOTH = []
 cfg.TRAIN.TRAIN_SECOND_STAGE = False
+cfg.TRAIN.BUFFERED_IOU = False    # expand jitter boxes by a buffer ratio before IoU labelling
+cfg.TRAIN.BUFFER_RATIO = 0.2
+cfg.TRAIN.MIN_BUFFER = 0.015
+cfg.TRAIN.FULL_CKPT = ""    # full checkpoint (dict key net) for fine-tune init; empty = off
 
 cfg.TRAIN.DROP_PATH_RATE = 0.1  # drop path rate for ViT backbone
 
@@ -83,6 +90,11 @@ cfg.DATA.SAMPLER_MODE = "causal"  # sampling methods
 cfg.DATA.MEAN = [0.485, 0.456, 0.406]
 cfg.DATA.STD = [0.229, 0.224, 0.225]
 cfg.DATA.MAX_SAMPLE_INTERVAL = 200
+# DATA.TIR_STACK
+cfg.DATA.TIR_STACK = edict()
+cfg.DATA.TIR_STACK.USE = False    # stack TIR frames into 3 channels (cur, prev, diff)
+cfg.DATA.TIR_STACK.DELTA = 1    # frame gap between stacked TIR frames
+cfg.DATA.TIR_STACK.TEMPLATE_STACK = True    # also stack the template frames
 # DATA.TRAIN
 cfg.DATA.TRAIN = edict()
 cfg.DATA.TRAIN.DATASETS_NAME = ["LASOT", "GOT10K_vottrain"]
@@ -104,6 +116,7 @@ cfg.DATA.SEARCH.NUMBER = 1
 cfg.DATA.SEARCH.RANDOM_JITTER_RATIO = 0.2
 cfg.DATA.SEARCH.RANDOM_CENTER_JITTER = 0
 cfg.DATA.SEARCH.RANDOM_SCALE_JITTER = 0.1
+cfg.DATA.SEARCH.MIN_CROP_SIZE = 64.0    # minimum crop size in pixels for tiny targets
 # DATA.SEARCH.GRID
 cfg.DATA.SEARCH.GRID = edict()
 cfg.DATA.SEARCH.GRID.TYPE = 'qp'
@@ -125,6 +138,7 @@ cfg.DATA.TEMPLATE.FACTOR = 2.0
 cfg.DATA.TEMPLATE.CENTER_JITTER = 0
 cfg.DATA.TEMPLATE.SCALE_JITTER = 0
 cfg.DATA.TEMPLATE.USE_GRID = False
+cfg.DATA.TEMPLATE.MIN_CROP_SIZE = 32.0
 
 # TEST
 cfg.TEST = edict()
@@ -133,6 +147,7 @@ cfg.TEST.EPOCH = 500
 cfg.TEST.TEMPLATE = edict()
 cfg.TEST.TEMPLATE.FACTOR = 2.0
 cfg.TEST.TEMPLATE.SIZE = 128
+cfg.TEST.TEMPLATE.MIN_CROP_SIZE = 32.0
 cfg.TEST.TEMPLATE.GRID = edict()
 cfg.TEST.TEMPLATE.GRID.USE_GRID = False
 # TEST.SEARCH
@@ -140,6 +155,7 @@ cfg.TEST.SEARCH = edict()
 cfg.TEST.SEARCH.SIZE = 320
 cfg.TEST.SEARCH.FACTOR = 5.0
 cfg.TEST.SEARCH.USE_GRID = False
+cfg.TEST.SEARCH.MIN_CROP_SIZE = 64.0
 # TEST.SEARCH.GRID
 cfg.TEST.SEARCH.GRID = edict()
 cfg.TEST.SEARCH.GRID.SHAPE = [17, 17]
@@ -157,6 +173,12 @@ cfg.TEST.MAX_SEARCH_FACTOR = 8
 cfg.TEST.ENLARGE_STEP = 1.0
 cfg.TEST.T_LOGITS = 0.8
 cfg.TEST.T_SCORE = 0.5
+cfg.TEST.GPU_CROP = False    # crop search/template regions on GPU
+cfg.TEST.T_CLS_PROB = 0.8    # sigmoid presence-prob threshold for SRA escalation
+cfg.TEST.DYNAMIC_TEMPLATE = False    # update the template online during tracking
+cfg.TEST.TEMPLATE_UPDATE_SCORE = 0.70
+cfg.TEST.TEMPLATE_UPDATE_PROB = 0.85
+cfg.TEST.TEMPLATE_UPDATE_MILESTONES = [2, 4, 8, 16]
 
 
 def _edict2dict(dest_dict, src_edict):

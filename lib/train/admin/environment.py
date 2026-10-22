@@ -25,6 +25,8 @@ def create_default_local_file():
         'davis_dir': empty_str,
         'youtubevos_dir': empty_str,
         'antiuav410_dir': empty_str,
+        'lsotb_tir_dir': empty_str,    # LSOTB-TIR: <root>/<seq>/img + groundtruth.txt, split <root>/train.txt
+        'runway_tir_dir': empty_str,    # private 1088x1088 thermal runway dataset, same layout
         'irstd1k_dir': empty_str,
         'irstd_dir': empty_str,
         })
@@ -74,6 +76,8 @@ def create_default_local_file_ITP_train(workspace_dir, data_dir):
         'davis_dir': empty_str,
         'youtubevos_dir': empty_str,
         'antiuav410_dir': os.path.join(data_dir, 'antiuav410/train'),
+        'lsotb_tir_dir': os.path.join(data_dir, 'lsotb_tir/train'),
+        'runway_tir_dir': os.path.join(data_dir, 'runway_tir/train'),
         'irstd1k_dir': os.path.join(data_dir, 'irstd1k/'),
         'irstd_dir': os.path.join(data_dir, 'irstd/'),
 })

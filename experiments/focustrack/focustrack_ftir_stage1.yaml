@@ -1,0 +1,120 @@
+DATA:
+  MAX_SAMPLE_INTERVAL: 200
+  MEAN:
+  - 0.485
+  - 0.456
+  - 0.406
+  SEARCH:
+    CENTER_JITTER: 4.5
+    FACTOR: 6.0
+    SCALE_JITTER: 0.5
+    SIZE: 256
+    NUMBER: 1
+    RANDOM_JITTER_RATIO: 0.2
+    RANDOM_CENTER_JITTER: 0
+    RANDOM_SCALE_JITTER: 0.1
+    MIN_CROP_SIZE: 64.0
+  STD:
+  - 0.229
+  - 0.224
+  - 0.225
+  TEMPLATE:
+    CENTER_JITTER: 0
+    FACTOR: 2.0
+    SCALE_JITTER: 0
+    SIZE: 128
+    MIN_CROP_SIZE: 32.0
+  TIR_STACK:
+    USE: True
+    DELTA: 1
+    TEMPLATE_STACK: True
+
+  TRAIN:
+    DATASETS_NAME:
+    - LSOTB_TIR
+    - AntiUAV410
+    DATASETS_RATIO:
+    - 1
+    - 1
+    SAMPLE_PER_EPOCH: 40000
+    POS_PROB: 0.7
+  VAL:
+    DATASETS_NAME:
+    - AntiUAV410
+    DATASETS_RATIO:
+    - 1
+    SAMPLE_PER_EPOCH: 10000
+MODEL:
+  PRETRAIN_FILE: "dropmae_pretrained_vit-B-16_k700_800E.pth"
+  BACKBONE:
+    TYPE: vit_base_patch16_224
+    STRIDE: 16
+    PATCH_SIZE: 16
+    CE_LOC: []
+    ADD_CLS_TOKEN: True
+    OUT_INDICES: [5, 7, 11]
+  DECODER:
+    ADD_DECODER: False
+    DECODER_DIM: 384
+    NUM_LAYERS: 3
+  HEAD:
+    BOX_HEAD:
+      TYPE: CENTER
+      NUM_CHANNELS: 256
+    CLS_HEAD:
+      USE_CLS_TOKEN: True
+      AVERAGE_POOL: True
+      AVERAGE_POOL_TYPE: attention_pool
+      HEAD_TYPE: mlp
+      NUM_CLASSES: 2
+TRAIN:
+  BACKBONE_MULTIPLIER: 0.1
+  DROP_PATH_RATE: 0.1
+  BATCH_SIZE: 32
+  EPOCH: 15
+  GIOU_WEIGHT: 2.0
+  L1_WEIGHT: 7.0
+  FOCALLOSS_WEIGHT: 1.0
+  CE_WEIGHT: 1.0
+  FOCALMASK_WEIGHT: 1.0
+  GRAD_CLIP_NORM: 0.1
+  LR: 0.0002
+  LR_DROP_EPOCH: 12
+  NUM_WORKER: 6
+  OPTIMIZER: ADAMW
+  PRINT_INTERVAL: 50
+  SCHEDULER:
+    TYPE: CosineAnnealingLR
+  VAL_EPOCH_INTERVAL: 20
+  WEIGHT_DECAY: 0.0001
+  AMP: False
+  SAVE_INTERVAL: 10
+  EXTRA_SAVE_EPOTH: [14,15]
+  TRAIN_SECOND_STAGE: True
+  BUFFERED_IOU: True
+  BUFFER_RATIO: 0.2
+  MIN_BUFFER: 0.015
+  # placeholder: point at the trained RGB runway checkpoint produced by runway_sra
+  # (base_trainer saves checkpoints as FocusTrack_ep{:04d}.pth.tar)
+  FULL_CKPT: "output/checkpoints/train/focustrack/runway_sra/FocusTrack_ep0030.pth.tar"
+TEST:
+  EPOCH: 15
+  USE_REGION_ADJUST: True
+  MAX_SEARCH_FACTOR: 8
+  ENLARGE_STEP: 1.0
+  T_LOGITS: 0.8
+  T_SCORE: 0.5
+  T_CLS_PROB: 0.8
+  GPU_CROP: True
+  DYNAMIC_TEMPLATE: True
+  TEMPLATE_UPDATE_SCORE: 0.7
+  TEMPLATE_UPDATE_PROB: 0.85
+  TEMPLATE_UPDATE_MILESTONES: [2, 4, 8, 16]
+  TEMPLATE:
+    FACTOR: 2.0
+    SIZE: 128
+    MIN_CROP_SIZE: 32.0
+  SEARCH:
+    FACTOR: 6.0
+    SIZE: 256
+    MIN_CROP_SIZE: 64.0

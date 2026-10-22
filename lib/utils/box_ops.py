@@ -89,6 +89,42 @@ def generalized_box_iou(boxes1, boxes2):
     return iou - (area - union) / area, iou
 
 
+def _buffer_boxes(boxes, buffer_ratio=0.2, min_buffer=0.015):
+    # symmetric expansion around the center, preserves x2 >= x1
+    x1, y1, x2, y2 = boxes.unbind(-1)
+    pad_w = torch.maximum((x2 - x1) * buffer_ratio, torch.full_like(x1, min_buffer))
+    pad_h = torch.maximum((y2 - y1) * buffer_ratio, torch.full_like(y1, min_buffer))
+    return torch.stack([x1 - pad_w, y1 - pad_h, x2 + pad_w, y2 + pad_h], dim=-1)
+
+
+def generalized_buffered_box_iou(boxes1, boxes2, buffer_ratio=0.2, min_buffer=0.015):
+    """
+    Generalized IoU between symmetrically buffered boxes, to stabilize gradients on tiny targets.
+
+    The boxes should be in [x0, y0, x1, y1] format; buffer amounts are in the same units as
+    the boxes (normalized [0,1] in training), expansion beyond the frame is fine for GIoU.
+    boxes1: (N, 4)
+    boxes2: (N, 4)
+    """
+    # degenerate boxes gives inf / nan results
+    # so do an early check on the raw boxes, since buffering repairs small inversions
+    assert (boxes1[:, 2:] >= boxes1[:, :2]).all()
+    assert (boxes2[:, 2:] >= boxes2[:, :2]).all()
+    return generalized_box_iou(_buffer_boxes(boxes1, buffer_ratio, min_buffer),
+                               _buffer_boxes(boxes2, buffer_ratio, min_buffer))
+
+
+def buffered_giou_loss(boxes1, boxes2, buffer_ratio=0.2, min_buffer=0.015):
+    """
+
+    :param boxes1: (N, 4) (x1,y1,x2,y2)
+    :param boxes2: (N, 4) (x1,y1,x2,y2)
+    :return:
+    """
+    giou, iou = generalized_buffered_box_iou(boxes1, boxes2, buffer_ratio, min_buffer)
+    return (1-giou), iou
+
+
 def giou_loss(boxes1, boxes2):
     """
 
