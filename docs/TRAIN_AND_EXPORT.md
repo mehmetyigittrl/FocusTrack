@@ -208,11 +208,31 @@ The export tool is part of the repo, so the whole pipeline travels with it.
    anywhere else need an explicit `--checkpoint` (otherwise the tool warns and
    exports random weights). The portable artifact is the `.onnx`; the
    `.engine` should be built on the machine/GPU that will run it.
-2. **Install export deps**. The target env needs the same runtime the model
-   code imports (torch + CUDA, torchvision, timm, matplotlib, pyyaml,
-   easydict, numpy — a clone of the training env is the easy way) plus
-   TensorRT (≥ 10.4; 11.x tested) and the ModelOpt/ONNX stack. On a networked
-   machine:
+2. **Get the Python environment there** — two options:
+
+   **Option A — carry the whole conda env with `conda-pack`** (tested
+   end-to-end with this exact env; simplest if the target has no internet):
+
+   ```bash
+   # on this machine (~7 GB archive from the ~12 GB env)
+   conda-pack -n gzs_env_2404 -o gzs_env_2404.tar.gz
+   # on the target machine (miniconda must be installed there)
+   mkdir -p ~/miniconda3/envs/gzs_env_2404
+   tar -xzf gzs_env_2404.tar.gz -C ~/miniconda3/envs/gzs_env_2404
+   ~/miniconda3/envs/gzs_env_2404/bin/python ~/miniconda3/envs/gzs_env_2404/bin/conda-unpack
+   conda activate gzs_env_2404
+   ```
+
+   One archive carries torch, TensorRT and the ModelOpt/ONNX stack together.
+   Verified after a full round-trip (pack → untar → conda-unpack → run
+   `tools/export_trt.py`): imports OK, engine builds, parity OK, ~560 FPS.
+   Target requirements: Ubuntu amd64, glibc ≥ 2.39 (Ubuntu 24.04 — check
+   `ldd --version`), NVIDIA driver ≥ 580 (torch cu130 / TRT 11.2 need it).
+
+   **Option B — install into an env that already exists on the target** (it
+   must already provide the model-code runtime: torch + CUDA, torchvision,
+   timm, matplotlib, pyyaml, easydict, numpy, plus TensorRT ≥ 10.4). On a
+   networked machine:
 
    ```bash
    uv pip install "nvidia-modelopt[onnx]" onnx onnxscript
@@ -229,6 +249,16 @@ The export tool is part of the repo, so the whole pipeline travels with it.
    # offline machine:
    uv pip install --no-index --find-links wheels/ "nvidia-modelopt[onnx]" onnx onnxscript
    ```
+
+   Two things live outside both the repo and the conda env — carry and fix
+   them by hand:
+
+   - `~/.local/lib/libturbojpeg.so.0` + `libturbojpeg.so.0.4.0` (~2 MB): the
+     training data loader dlopens libturbojpeg through `LD_LIBRARY_PATH`.
+     Copy them anywhere on the target and point `LD_LIBRARY_PATH` at that dir.
+   - `lib/train/admin/local.py` and `lib/test/evaluation/local.py` hardcode
+     absolute paths (`/home/<user>/Desktop/FocusTrack/...`) — edit them if the
+     target layout or username differs.
 3. **Export there** (same commands as §3.1 — watch for the random-weights
    warning if the checkpoint isn't found). If the GPU differs from the
    training box, that's fine — the engine is built on the machine you run the
