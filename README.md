@@ -117,6 +117,14 @@ python tracking/test.py --tracker_name focustrack --tracker_param focustrack_sta
 
 
 
+## Runway adaptation: training & TensorRT FP16 export
+
+For the ground-camera aircraft-tracking adaptation (SRA-only `runway_sra`
+config, small-target changes, TIR two-stage fine-tune) and for exporting a
+trained checkpoint to a TensorRT FP16 engine via NVIDIA ModelOpt
+(`tools/export_trt.py`), see **[docs/TRAIN_AND_EXPORT.md](docs/TRAIN_AND_EXPORT.md)**.
+
+
 ## Visualization or Debug 
 [Visdom](https://github.com/fossasia/visdom) is used for visualization. 
 1. Alive visdom in the server by running `visdom`:
