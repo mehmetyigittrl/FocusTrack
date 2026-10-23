@@ -74,6 +74,19 @@ Robustness and re-run behavior:
 * The --output tree is excluded from ALL input scanning, so it may safely be
   nested inside --input (an upfront warning notes the exclusion); using the
   same directory for --input and --output is refused.
+* --jobs N (default: min(16, cpu_count)) plans and writes sequences on a
+  thread pool.  The dominant costs — per-frame decode verification, image
+  file resolution and frame copying — release the GIL, so threads scale;
+  cv2 is pinned to one internal thread per worker (many small decodes beat
+  cv2's own all-core threading inside each call).  Sequence names are
+  allocated serially and task results/warnings merge strictly in submission
+  order, so the output tree, manifest and warning order are identical to
+  --jobs 1; --jobs 1 restores the fully serial behavior.  One deliberate
+  difference on the FAILURE path only: with --jobs > 1 an aborted run
+  (--strict error, failed hardlink/re-encode) may already have written
+  sequences a serial run would never have reached — the exit code and the
+  first reported error are identical, no manifest is written, and the next
+  run's reconcile pass prunes the leftovers.
 
 The tool is stdlib-first (json/argparse/pathlib/shutil/re).  cv2/PIL are
 imported lazily only when an image actually has to be decoded: verification
@@ -95,9 +108,11 @@ import os
 import re
 import shutil
 import sys
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from pathlib import Path
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 JPEG_EXTS = {".jpg", ".jpeg"}
@@ -722,20 +737,36 @@ def plan_from_entries(name, entries, anns_by_img, resolve, doc, opts, ctx, warni
 
 
 def plan_per_video(input_dir, per_video_map, opts, allocator, warnings,
-                   exclude_real=None):
-    plans = []
+                   exclude_real=None, jobs=1):
+    """Plan every per-video sequence.
+
+    Sequence names are allocated in a serial pass first (the allocator is not
+    thread-safe and name assignment must not depend on thread scheduling);
+    then each subfolder — an independent unit holding its own jsons, frame
+    scan and decode verification — is planned as one task on the pool.
+    Results and warnings merge in sorted-subfolder order, byte-identical to
+    the serial run."""
+    grouped = {}
     for subfolder in sorted(per_video_map):
         jsons = sorted(per_video_map[subfolder])
         multi = len(jsons) > 1
-        named_dirs, bindex = scan_subfolder(subfolder, exclude_real)
+        grouped[subfolder] = []
         for json_path, doc in jsons:
             stem_base = subfolder.name if not multi else "{}_{}".format(subfolder.name, json_path.stem)
-            name = allocator.alloc(sanitize_name(stem_base))
+            grouped[subfolder].append((json_path, doc,
+                                       allocator.alloc(sanitize_name(stem_base))))
+
+    def plan_subfolder(item):
+        subfolder, group = item
+        local = []
+        plans_here = []
+        named_dirs, bindex = scan_subfolder(subfolder, exclude_real)
+        for json_path, doc, name in group:
             ctx = "sequence '{}' ({})".format(name, json_path)
-            images = dedupe_images(doc.get("images", []), ctx, warnings)
+            images = dedupe_images(doc.get("images", []), ctx, local)
             entries, has_explicit = order_images(images)
             roots = [json_path.parent] + named_dirs + [subfolder]
-            anns_by_img = group_annotations(doc, entries, ctx, warnings)
+            anns_by_img = group_annotations(doc, entries, ctx, local)
 
             def resolve(fn, roots=roots, bindex=bindex):
                 return resolve_image(fn, roots, bindex)
@@ -750,13 +781,20 @@ def plan_per_video(input_dir, per_video_map, opts, allocator, warnings,
                         if os.path.realpath(str(p)) not in claimed]
 
             plan = plan_from_entries(name, entries, anns_by_img, resolve, doc,
-                                     opts, ctx, warnings,
-                                     extras_fn=extras_fn if not multi else None,
+                                     opts, ctx, local,
+                                     extras_fn=extras_fn if len(group) == 1 else None,
                                      has_explicit=has_explicit)
-
             plan["source_json"] = str(json_path)
             plan["source_subfolder"] = str(subfolder)
-            plans.append(plan)
+            plans_here.append(plan)
+        return plans_here, local
+
+    tasks = [partial(plan_subfolder, (sub, grouped[sub]))
+             for sub in sorted(grouped)]
+    # run_plan_tasks merges each task's local warnings in order already
+    plans = []
+    for plans_here in run_plan_tasks(tasks, jobs, warnings):
+        plans.extend(plans_here)
     return plans
 
 
@@ -795,22 +833,46 @@ def global_image_roots(input_dir, json_path, base, images_subdir, exclude_real=N
 
 
 def plan_global(input_dir, global_jsons, opts, allocator, warnings,
-                exclude_real=None):
+                exclude_real=None, jobs=1):
     plans = []
     remaining = opts.limit
     if opts.limit is not None and opts.limit <= 0:
         warn("--limit {} caps the run at zero images; nothing to convert".format(opts.limit), warnings)
         return plans
+
+    def plan_chunk(spec):
+        name, chunk, anns_by_img, resolve, doc, ctx, json_path = spec
+        local = []
+        plan = plan_from_entries(name, chunk, anns_by_img, resolve, doc, opts,
+                                 ctx, local)
+        plan["source_json"] = str(json_path)
+        plan["source_subfolder"] = None
+        return plan, local
+
+    # Serial pass over the jsons: dedupe/order/group, apply --limit slicing,
+    # build the per-json resolve state (read-only at task runtime), and
+    # allocate chunk names deterministically.  The chunks themselves — the
+    # decode-verify/resolve-heavy part — then run as pool tasks.
+    tasks = []
     for json_path, doc in sorted(global_jsons):
         if remaining is not None and remaining <= 0:
             break
         ctx0 = "json {}".format(json_path)
+        # json-level warnings (duplicate ids/names, orphan annotations) must
+        # land at this json's serial position, not all before every chunk's:
+        # a pass-through task placed ahead of the chunk tasks merges them
+        # there, keeping the warning order identical to the serial tool.
+        prep_local = []
+        images = dedupe_images(doc.get("images", []), ctx0, prep_local)
+        entries, _has_explicit = order_images(images)
+        anns_by_img = group_annotations(doc, entries, ctx0, prep_local)
+        if prep_local:
+            def emit_prep(preps):
+                return None, list(preps)
+            tasks.append(partial(emit_prep, prep_local))
         stem = json_path.stem
         base = stem[len("instances_"):] if stem.lower().startswith("instances_") else stem
         base = sanitize_name(base)
-        images = dedupe_images(doc.get("images", []), ctx0, warnings)
-        entries, _has_explicit = order_images(images)
-        anns_by_img = group_annotations(doc, entries, ctx0, warnings)
         if remaining is not None:
             entries = entries[:remaining]
         roots = global_image_roots(input_dir, json_path, base, opts.images_subdir,
@@ -831,12 +893,12 @@ def plan_global(input_dir, global_jsons, opts, allocator, warnings,
             chunk = entries[ci:ci + opts.seq_len]
             name = allocator.alloc("{}_seq{:04d}".format(base, ci // opts.seq_len + 1))
             ctx = "sequence '{}' ({})".format(name, json_path)
-            plan = plan_from_entries(name, chunk, anns_by_img, resolve, doc, opts, ctx, warnings)
-            plan["source_json"] = str(json_path)
-            plan["source_subfolder"] = None
-            plans.append(plan)
+            spec = (name, chunk, anns_by_img, resolve, doc, ctx, json_path)
+            tasks.append(partial(plan_chunk, spec))
         if remaining is not None:
             remaining -= len(entries)
+    # pass-through warning-merge tasks yield None; keep only the chunk plans
+    plans.extend(r for r in run_plan_tasks(tasks, jobs, warnings) if r is not None)
     return plans
 
 
@@ -921,6 +983,45 @@ def warn(msg, warnings):
     print("WARNING: {}".format(msg), file=sys.stderr)
 
 
+def _limit_cv2_threads():
+    """Pin cv2 to one internal thread (used when --jobs > 1: many small
+    per-frame decodes/encodes across workers beat cv2's own all-core
+    threading inside each call).  No-op when cv2 is not installed."""
+    try:
+        import cv2  # type: ignore
+    except Exception:
+        return
+    try:
+        cv2.setNumThreads(1)
+    except Exception:
+        pass
+
+
+def run_plan_tasks(tasks, jobs, warnings):
+    """Run zero-arg planning/writing tasks, preserving serial semantics.
+
+    Each task returns (result, local_warnings).  With jobs > 1 the tasks run
+    on a thread pool — the dominant work (cv2/PIL decode verification,
+    stat-heavy file resolution, frame copying, re-encoding) releases the GIL,
+    so threads scale.  Results are collected and local warnings merged
+    strictly in task order regardless of completion order, keeping the output
+    tree, manifest and warning sequence identical to --jobs 1.  A
+    ConverterError raised inside a task re-raises from the main thread at the
+    first offending task in order (executor.map semantics), like serial."""
+    results = []
+    if jobs <= 1 or len(tasks) <= 1:
+        for task in tasks:
+            result, local = task()
+            warnings.extend(local)
+            results.append(result)
+        return results
+    with ThreadPoolExecutor(max_workers=jobs) as pool:
+        for result, local in pool.map(lambda t: t(), tasks):
+            warnings.extend(local)
+            results.append(result)
+    return results
+
+
 def build_argparser():
     p = argparse.ArgumentParser(
         prog="coco2antiuav410",
@@ -975,6 +1076,13 @@ def build_argparser():
                         "copying/linking them (default: verify; undecodable "
                         "frames are skipped with a warning — trades extra I/O "
                         "for guaranteed-readable output frames)")
+    p.add_argument("--jobs", type=int, default=min(16, os.cpu_count() or 4),
+                   metavar="N",
+                   help="number of worker threads for planning (decode "
+                        "verification, file resolution) and writing frames "
+                        "(default: min(16, cpu_count)); --jobs 1 is fully "
+                        "serial.  Output, manifest and warning order are "
+                        "identical for any N")
     p.add_argument("--version", action="version", version="%(prog)s " + VERSION)
     return p
 
@@ -991,6 +1099,11 @@ def main(argv=None):
     if opts.val_ratio is not None and not (0.0 < opts.val_ratio < 1.0):
         print("ERROR: --val-ratio must satisfy 0 < R < 1", file=sys.stderr)
         return 2
+    if opts.jobs < 1:
+        print("ERROR: --jobs must be >= 1", file=sys.stderr)
+        return 2
+    if opts.jobs > 1:
+        _limit_cv2_threads()  # before any pool: workers share one cv2 runtime
 
     input_dir = Path(opts.input).expanduser().resolve()
     output_dir = Path(opts.output).expanduser().resolve()
@@ -1030,10 +1143,10 @@ def main(argv=None):
         allocator = NameAllocator()
         if mode == "per_video":
             plans = plan_per_video(input_dir, per_video_map, opts, allocator,
-                                   warnings, exclude_real)
+                                   warnings, exclude_real, jobs=opts.jobs)
         else:
             plans = plan_global(input_dir, global_jsons, opts, allocator,
-                                warnings, exclude_real)
+                                warnings, exclude_real, jobs=opts.jobs)
 
         # drop / warn pass (visible counts are known once planned)
         kept, dropped = [], []
@@ -1069,8 +1182,15 @@ def main(argv=None):
         # same-name dir in a split other than the planned one
         pruned = reconcile_output(output_dir, kept, warnings)
         place_mode = "link" if opts.link else ("symlink" if opts.symlink else "copy")
-        for plan in sorted(kept, key=lambda p: p["name"]):
+
+        def write_one(plan):
             write_sequence(output_dir, plan, plan["split"], place_mode)
+            return None, []
+
+        # one task per sequence: disjoint dirs, so writes are independent
+        run_plan_tasks([partial(write_one, p)
+                        for p in sorted(kept, key=lambda p: p["name"])],
+                       opts.jobs, warnings)
 
         manifest = {
             "tool": "coco2antiuav410",
@@ -1094,6 +1214,7 @@ def main(argv=None):
                 "symlink": opts.symlink,
                 "strict": opts.strict,
                 "verify_frames": opts.verify_frames,
+                "jobs": opts.jobs,
             },
             "sequences": [
                 {

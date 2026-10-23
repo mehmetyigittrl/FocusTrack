@@ -1074,3 +1074,95 @@ def test_undecodable_disk_only_extra_dropped_and_warned(tmp_path):
     man = json.loads((out / "manifest.json").read_text())
     assert man["sequences"][0]["n_undecodable"] == 1
     assert any("undecodable" in w and "img_0002.jpg" in w for w in man["warnings"])
+
+
+# --------------------------------------------------------------------------
+# --jobs (thread-parallel execution)
+# --------------------------------------------------------------------------
+
+def _normalized_manifest(out):
+    man = json.loads((Path(out) / "manifest.json").read_text())
+    man["output"] = "OUT"
+    man["args"]["jobs"] = "J"
+    return man
+
+
+def test_jobs_parallel_identical_to_serial(tmp_path):
+    # varied warnings (disk-only extra, skipped missing file, short sequence)
+    # so any ordering nondeterminism would show up in the manifest
+    build_video(tmp_path / "in", "videoA", [
+        ("img_0001.jpg", [([1.0, 2.0, 5.0, 6.0], 3, 0)]),
+        ("img_0002.jpg", []),
+        ("img_0003.jpg", [([3.0, 4.0, 5.0, 6.0], 3, 0)]),
+    ])
+    write_image(tmp_path / "in" / "videoA" / "img_0009.jpg")  # disk-only extra
+    build_video(tmp_path / "in", "videoB", [
+        ("f1.jpg", [([1.0, 1.0, 4.0, 4.0], 3, 0)]),
+        ("f2.jpg", [([2.0, 2.0, 4.0, 4.0], 3, 0)]),
+    ])
+    (tmp_path / "in" / "videoB" / "f2.jpg").unlink()  # json entry -> missing file
+    build_video(tmp_path / "in", "videoC", [
+        ("solo.jpg", [([1.0, 1.0, 3.0, 3.0], 3, 0)]),
+    ])  # below MIN_TRAINER_VISIBLE -> extra warning from the main pass
+
+    out1, out2 = tmp_path / "out_j1", tmp_path / "out_j4"
+    r1 = run_converter("--input", tmp_path / "in", "--output", out1, "--jobs", 1)
+    r2 = run_converter("--input", tmp_path / "in", "--output", out2, "--jobs", 4)
+    assert r1.returncode == 0, r1.stderr
+    assert r2.returncode == 0, r2.stderr
+
+    files1 = sorted(str(p.relative_to(out1)) for p in out1.rglob("*") if p.is_file())
+    files2 = sorted(str(p.relative_to(out2)) for p in out2.rglob("*") if p.is_file())
+    assert [f for f in files1 if not f.endswith("manifest.json")] == \
+           [f for f in files2 if not f.endswith("manifest.json")]
+    for rel in files1:
+        if rel.endswith("manifest.json"):
+            continue
+        assert (out1 / rel).read_bytes() == (out2 / rel).read_bytes(), rel
+    assert _normalized_manifest(out1) == _normalized_manifest(out2)
+
+
+def test_global_mode_warning_order_matches_serial(tmp_path):
+    # json a.json produces a CHUNK warning (missing image file), b.json a
+    # PREP warning (duplicate image id): the chunk warning of a must come
+    # first, as in the serial tool (prep warnings interleave per json)
+    root = tmp_path / "in"
+    (root / "annotations").mkdir(parents=True)
+    write_image(root / "a1.jpg")
+    write_image(root / "b1.jpg")
+    write_image(root / "b2.jpg")
+    write_coco(root / "annotations" / "a.json",
+               [img_entry(1, "a1.jpg"), img_entry(2, "a2.jpg")],
+               [ann(1, 1, [1.0, 1.0, 5.0, 5.0])])  # a2.jpg missing on disk
+    write_coco(root / "annotations" / "b.json",
+               [img_entry(1, "b1.jpg"), img_entry(1, "b2.jpg")],  # dup id
+               [ann(1, 1, [1.0, 1.0, 5.0, 5.0])])
+    for jobs in (1, 4):
+        out = tmp_path / "out_j{}".format(jobs)
+        r = run_converter("--input", root, "--output", out, "--jobs", jobs)
+        assert r.returncode == 0, r.stderr
+        warns = json.loads((out / "manifest.json").read_text())["warnings"]
+        idx_missing = next(i for i, w in enumerate(warns) if "image file not found" in w)
+        idx_dup = next(i for i, w in enumerate(warns) if "duplicate image id" in w)
+        assert idx_missing < idx_dup
+
+
+def test_jobs_zero_rejected(tmp_path):
+    build_video(tmp_path / "in", "v", [("a.jpg", [([1.0, 1.0, 3.0, 3.0], 3, 0)])])
+    r = run_converter("--input", tmp_path / "in", "--output", tmp_path / "out",
+                      "--jobs", 0)
+    assert r.returncode == 2
+    assert "--jobs" in r.stderr
+
+
+def test_strict_abort_at_jobs_gt_1_reports_offending_subfolder(tmp_path):
+    for i in range(6):
+        build_video(tmp_path / "in", "vid{:02d}".format(i),
+                    [("f.jpg", [([1.0, 1.0, 3.0, 3.0], 3, 0)])])
+    (tmp_path / "in" / "vid03" / "f.jpg").unlink()  # strict: missing file aborts
+    r = run_converter("--input", tmp_path / "in", "--output", tmp_path / "out",
+                      "--strict", "--jobs", 4)
+    assert r.returncode == 2
+    assert "vid03" in r.stderr and "f.jpg" in r.stderr
+    assert "Traceback" not in r.stderr
+    assert not (tmp_path / "out" / "manifest.json").exists()
